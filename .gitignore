@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.env
+.arena-credentials
+.arena-*
+plutus.log
+decisions.jsonl
+performance_log.json
+performance_history.csv
+performance_dashboard.json
+.arena-action-tx.json
+ab_tests.json
+strategy_report.json
+*.tmp
