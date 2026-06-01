@@ -1,7 +1,14 @@
-"""agent/meta_learner.py — multi-style strategy selection with bootstrap validation."""
+"""agent/meta_learner.py — UCB1-bandit strategy selection with bootstrap validation.
+
+Strategy selection uses UCB1 (Upper Confidence Bound) which is theoretically
+optimal for exploration-exploitation in a multi-armed bandit setting.
+UCB1: select strategy i = argmax(avg_reward_i + sqrt(2 * ln(total_pulls) / pulls_i))
+Switching threshold: UCB1 upper bound of best > lower bound of current by 0.5 bb/100.
+"""
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from collections import deque
@@ -111,17 +118,38 @@ class MetaLearner:
         )
 
     def _best_strategy_by_history(self) -> str:
+        """UCB1 bandit: balance exploration and exploitation.
+
+        UCB1 score = avg_reward + sqrt(2 * ln(total_pulls) / pulls_i)
+        Strategies with fewer samples get a bonus to encourage exploration.
+        Switch only if best UCB1 upper bound exceeds current strategy's avg by 0.5 bb/100.
+        """
+        total_pulls = sum(len(self._history[s]) for s in STRATEGIES)
+        if total_pulls == 0:
+            return self.active
+
         best_name = self.active
-        best_ev = -1e9
+        best_ucb1 = -1e9
         for s in STRATEGIES:
             hist = self._history[s]
-            if not hist:
-                continue
-            ev = sum(hist) / len(hist)
-            if ev > best_ev:
-                best_ev = ev
+            pulls = len(hist)
+            if pulls == 0:
+                # Unsampled strategy: give it max exploration bonus
+                ucb1 = 2.0
+            else:
+                avg = sum(hist) / pulls
+                exploration = math.sqrt(2 * math.log(max(1, total_pulls)) / pulls)
+                ucb1 = avg + exploration
+            if ucb1 > best_ucb1:
+                best_ucb1 = ucb1
                 best_name = s
-        return best_name if best_ev > -1e8 else self.active
+
+        # Only switch if meaningful improvement (> 0.5 bb/100 over current)
+        current_hist = self._history[self.active]
+        current_avg = sum(current_hist) / max(1, len(current_hist)) if current_hist else -1e9
+        if best_name == self.active or best_ucb1 < current_avg + 0.5:
+            return self.active
+        return best_name
 
     def validate_performance(
         self,

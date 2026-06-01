@@ -147,7 +147,7 @@ class AdaptiveMemory:
             return
 
         self._analyze_hand(decisions, stack_delta, won, bb_size)
-        self.post_hand_review(decisions, stack_delta, won, bb_size)
+        self.post_hand_review(decisions, stack_delta, won, bb_size)  # called once only
         self.tuning.clamp()
         self.save()
         if self.mistakes.hands_reviewed % 50 == 0:
@@ -233,21 +233,38 @@ class AdaptiveMemory:
         won: Optional[bool],
         bb_size: float,
     ) -> None:
-        """Adjust strategy line weights from big pot outcomes."""
+        """Adjust strategy line weights from big pot outcomes.
+
+        Fixes: (1) decay all weights per hand to prevent drift to extremes,
+               (2) use full mode string mapped to correct key.
+        """
         bb = max(1.0, bb_size)
         big = abs(stack_delta) >= 8 * bb
-        mode_key = self._last_strategy_mode.split("_")[0]
-        if mode_key not in self.strategy_weights:
-            mode_key = "gto"
+
+        # Mode string -> weight key mapping (fixes the split("_")[0] bug)
+        _mode_map = {
+            "intimidation": "intimidation",
+            "exploitation": "exploitation",
+            "gto_balanced": "gto",
+            "icm_survival": "icm",
+            "push_fold": "icm",
+            "endgame_close": "endgame",
+        }
+        mode_key = _mode_map.get(self._last_strategy_mode, "gto")
+
+        # Decay all weights slightly each hand to prevent lock-in (0.999 per hand)
+        for k in self.strategy_weights:
+            self.strategy_weights[k] = max(0.6, min(1.5, self.strategy_weights[k] * 0.999))
+
         if big and stack_delta > 0:
             self.strategy_weights[mode_key] = min(
-                1.5, self.strategy_weights.get(mode_key, 1.0) * 1.05
+                1.5, self.strategy_weights.get(mode_key, 1.0) * 1.06
             )
         elif big and stack_delta < 0:
             for d in decisions:
                 if d.mistake:
                     self.strategy_weights[mode_key] = max(
-                        0.6, self.strategy_weights.get(mode_key, 1.0) * 0.95
+                        0.6, self.strategy_weights.get(mode_key, 1.0) * 0.94
                     )
                     break
 

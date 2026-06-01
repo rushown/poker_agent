@@ -221,6 +221,27 @@ class StrategyArbiter:
                 fold_to_3bet=fold_to_3bet,
                 fold_to_cbet=fold_to_cbet,
             )
+        elif meta_style == "EXPLOIT":
+            # EXPLOIT: immediately run the opponent-specific exploit logic
+            exploit_now = get_exploit_action(
+                stats=table_stats,
+                ehs=ehs,
+                pot=ctx.pot,
+                stack=ctx.stack,
+                street=ctx.street,
+                is_in_position=ctx.is_in_position,
+                allowed_actions=ctx.allowed_actions,
+                community=ctx.community_cards,
+            )
+            if exploit_now:
+                amount = self._clamp(exploit_now.amount, ctx.allowed_actions, ctx.stack)
+                return self._finalize(
+                    ctx, exploit_now.action, amount,
+                    f"{exploit_now.reasoning} | EXPLOIT meta",
+                    mode, meta_style,
+                )
+            # No exploit found — fall through to GTO
+            gto_action, gto_amount, gto_reason = self._gto_decision(ctx, ehs, fold_to_3bet, fold_to_cbet, tuning)
         elif ctx.street == "preflop":
             gto_action, gto_amount, gto_reason = preflop_action(
                 hole=ctx.hole_cards,
@@ -246,10 +267,8 @@ class StrategyArbiter:
                 allowed_actions=ctx.allowed_actions,
                 board_texture=board_texture,
                 fold_to_cbet=fold_to_cbet if fold_to_cbet_opps_ok(table_stats) else 0.45,
-                bet_size_mult=0.33 if table_stats.archetype == "nit" else (
-                    0.75 if table_stats.archetype == "fish" else 0.5
-                ),
                 tuning=tuning,
+                opponent_af=table_stats.aggression_factor,
             )
 
         fold_eq = calculate_fold_equity(max(fold_to_3bet, table_stats.fold_to_steal))
@@ -297,6 +316,47 @@ class StrategyArbiter:
         )
         return self._finalize(ctx, gto_action, amount, chat, mode, meta_style)
 
+    def _gto_decision(
+        self,
+        ctx: GameContext,
+        ehs: float,
+        fold_to_3bet: float,
+        fold_to_cbet: float,
+        tuning: Any,
+    ) -> Tuple[str, float, str]:
+        """Pure GTO path extracted for reuse by EXPLOIT fallback."""
+        if ctx.street == "preflop":
+            return preflop_action(
+                hole=ctx.hole_cards,
+                position=ctx.position,
+                is_facing_raise=ctx.is_facing_raise,
+                facing_raise_size=ctx.facing_raise_size,
+                bb_size=ctx.bb_size,
+                stack=ctx.stack,
+                pot=ctx.pot,
+                allowed_actions=ctx.allowed_actions,
+                fold_to_3bet_avg=fold_to_3bet,
+                tuning=tuning,
+            )
+        board_texture = self._board_texture(ctx.community_cards)
+        return postflop_action(
+            ehs=ehs,
+            pot=ctx.pot,
+            call_amount=ctx.call_amount,
+            stack=ctx.stack,
+            street=ctx.street,
+            is_in_position=ctx.is_in_position,
+            allowed_actions=ctx.allowed_actions,
+            board_texture=board_texture,
+            fold_to_cbet=fold_to_cbet,
+            tuning=tuning,
+            opponent_af=self.tracker.table_weighted_stats(ctx.opponent_ids).aggression_factor,
+        )
+
+    def _spr(self, ctx: GameContext) -> float:
+        """Stack-to-pot ratio — drives commitment decisions."""
+        return ctx.stack / max(1.0, ctx.pot)
+
     def _apply_bot_exploit(
         self,
         ctx: GameContext,
@@ -307,17 +367,54 @@ class StrategyArbiter:
         stats_map: Dict[str, OpponentStats],
         fold_eq: float,
     ) -> Tuple[str, float, str]:
+        from models.bot_pattern_detector import BotType as BT
         for oid in ctx.opponent_ids:
             prof = self.detector.get_profile(oid)
-            if not prof:
+            if not prof or prof.confidence < 0.50:
                 continue
-            if prof.bot_type == BotType.NIT and ctx.street == "preflop" and not ctx.is_facing_raise:
-                if ctx.position in ("CO", "BTN", "SB") and ehs >= 0.25:
-                    return "raise", min(ctx.stack, ctx.bb_size * 2.5), f"Steal orbit vs nit FE={fold_eq:.0%}"
-            if prof.bot_type == BotType.CALLING_STATION and ehs >= 0.55:
-                return "raise", min(ctx.stack, ctx.pot * 0.75), "Value station — no bluffs"
-            if prof.bot_type == BotType.SCARED_MONEY and fold_eq > 0.6:
-                return "raise", min(ctx.stack, ctx.pot * 1.2), "Pressure scared money"
+
+            # Nit / scared money: steal wide in position
+            if prof.bot_type in (BT.NIT, BT.SCARED_MONEY):
+                if ctx.street == "preflop" and not ctx.is_facing_raise:
+                    if ctx.position in ("CO", "BTN", "SB") and fold_eq >= 0.55:
+                        return (
+                            "raise",
+                            min(ctx.stack, ctx.bb_size * 2.3),
+                            f"Steal vs {prof.bot_type.value} FE={fold_eq:.0%}",
+                        )
+                # Postflop: small cbet steal (they fold a lot)
+                if ctx.street in ("flop", "turn") and ctx.is_in_position and ehs < 0.45 and fold_eq >= 0.60:
+                    return (
+                        "raise",
+                        min(ctx.stack, ctx.pot * 0.35),
+                        f"Cbet steal vs {prof.bot_type.value} FE={fold_eq:.0%}",
+                    )
+
+            # Calling station: max value, never bluff
+            if prof.bot_type == BT.CALLING_STATION:
+                if ehs >= 0.58:
+                    return (
+                        "raise",
+                        min(ctx.stack, ctx.pot * 0.90),
+                        "Max value vs calling station",
+                    )
+                if ehs < 0.35 and action in ("raise",):
+                    return "check", 0, "No bluff vs calling station"
+
+            # Maniac: trap, let them bluff
+            if prof.bot_type == BT.MANIAC:
+                if ehs >= 0.80 and not ctx.is_in_position:
+                    can_check = any(a.get("action") == "check" for a in ctx.allowed_actions)
+                    if can_check:
+                        return "check", 0, "Trap maniac OOP — induce bluff"
+
+            # Range-static: 3-bet wide preflop (they don't adjust)
+            if prof.bot_type == BT.RANGE_STATIC:
+                if ctx.street == "preflop" and ctx.is_facing_raise and ehs >= 0.40:
+                    from agent.preflop_ranges import three_bet_size
+                    amt = three_bet_size(ctx.position, ctx.facing_raise_size, ctx.bb_size, ctx.stack)
+                    return "raise", amt, "3-bet range-static bot"
+
         return action, amount, reason
 
     def _finalize(
@@ -360,10 +457,12 @@ class StrategyArbiter:
             ehs=self._last_ehs,
             strategy_mode=mode.value,
         )
-        full_chat = f"{chat} {tilt} {mistake}".strip()
-        if not full_chat:
-            full_chat = f"mode={mode.value} meta={meta_style} EHS={self._last_ehs:.0%} {action}"
-        return action, amount, full_chat[:500]
+        # Strip internal strategic info from chat to avoid leaking reads to opponents
+        safe_chat = tilt.strip() if tilt.strip() else action.upper()
+        if mistake:
+            safe_chat = f"{safe_chat} {mistake}".strip()
+        # Keep internal chat for logging only — return only safe public text
+        return action, amount, safe_chat[:200]
 
     def _safety_override(
         self, ctx: GameContext
@@ -424,12 +523,22 @@ class StrategyArbiter:
         return "fold", 0, "Time budget — fold"
 
     def _board_texture(self, community: List[str]) -> str:
+        """Classify board as dry/wet/monotone/paired for bet-sizing decisions."""
         if len(community) < 3:
             return "dry"
         from engine.hand_eval import card_rank, card_suit
         suits = [card_suit(c) for c in community]
-        ranks = [card_rank(c) for c in community]
-        if len(set(suits)) <= 2 or (max(ranks) - min(ranks)) <= 4:
+        ranks = sorted(card_rank(c) for c in community)
+        # Monotone: all same suit (most dangerous for flush)
+        if len(set(suits)) == 1:
+            return "monotone"
+        # Paired board: one rank appears twice+ (set/boat dynamics)
+        if len(set(ranks)) < len(ranks):
+            return "paired"
+        # Wet: flush draw or straight draw possible
+        flush_draw = len(set(suits)) == 2
+        straight_draw = (max(ranks) - min(ranks)) <= 4 and len(set(ranks)) >= 3
+        if flush_draw or straight_draw:
             return "wet"
         return "dry"
 

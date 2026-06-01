@@ -201,7 +201,11 @@ class TestOpponentTracker:
         s.hands_seen = 100
         c100 = s.confidence
         assert c100 > c0
-        assert c100 > 0.9
+        # Research formula: 0.5 + 0.4*(1-exp(-100/100)) ≈ 0.75 at 100 hands
+        # Deliberate: avoid overconfidence at low sample sizes
+        assert c100 > 0.70
+        s.hands_seen = 300
+        assert s.confidence > 0.88
 
 
 # ===========================================================================
@@ -495,8 +499,11 @@ class TestPreflopFreq:
 
     def test_frequency_range(self):
         from agent.preflop_ranges import open_frequency
-        assert open_frequency("AJo", "UTG") == 1.0
+        # AJo UTG is a mixed-strategy hand (solver: ~70% open) — not always open
+        assert 0.5 <= open_frequency("AJo", "UTG") <= 1.0
         assert open_frequency("AA", "BTN") == 1.0
+        # BTN opens wider than UTG
+        assert open_frequency("76s", "BTN") > open_frequency("76s", "UTG")
 
 
 class TestAdaptive:

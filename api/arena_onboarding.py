@@ -138,11 +138,15 @@ def start_benchmark_match(client: ArenaClient, competition_id: str) -> Dict[str,
     try:
         result = client.start_benchmark(competition_id)
     except ArenaAPIError as e:
-        if e.status == 403:
+        if e.status == 409:
+            logger.info("Benchmark match already exists — resuming via status endpoint")
+            result = client.get_benchmark_status(competition_id)
+        elif e.status == 403:
             claim = client.get_claim_status()
             logger.error(f"Claim required: {claim.get('claimUrl', claim)}")
             raise
-        raise
+        else:
+            raise
 
     match = result.get("match") or {}
     logger.info(
