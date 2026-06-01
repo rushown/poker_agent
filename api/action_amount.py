@@ -112,6 +112,52 @@ def format_submission_amount(
     return amount
 
 
+def _chip_amount(value: float) -> int:
+    """Arena uses whole-chip amounts; fractional values cause 400 errors."""
+    return max(0, int(round(value)))
+
+
+def finalize_action_payload(
+    body: Dict[str, Any],
+    table: Dict[str, Any],
+    agent_id: str,
+) -> Dict[str, Any]:
+    """Clamp amounts and align action name with allowedActions."""
+    aa = raw_allowed(table)
+    avail = {
+        str(a).lower().replace("_", "-")
+        for a in (aa.get("availableActions") or [])
+    }
+    act = str(body.get("action", "fold")).lower().replace("_", "-")
+    if act == "bet" and "bet" not in avail and "raise" in avail:
+        act = "raise"
+        body["action"] = "raise"
+    elif act == "raise" and "raise" not in avail and "bet" in avail:
+        act = "bet"
+        body["action"] = "bet"
+
+    if body.get("amount") is not None and float(body["amount"]) > 0:
+        amt = _chip_amount(float(body["amount"]))
+        rr = aa.get("raiseRange") or aa.get("betRange") or {}
+        if rr and act in ("raise", "bet"):
+            rmin = rr.get("min")
+            rmax = rr.get("max")
+            if rmin is not None:
+                amt = max(_chip_amount(float(rmin)), amt)
+            if rmax is not None:
+                amt = min(_chip_amount(float(rmax)), amt)
+        mn = aa.get("minRaiseTo") or aa.get("minBet")
+        if mn is not None and act in ("raise", "bet"):
+            amt = max(_chip_amount(float(mn)), amt)
+        if act == "call":
+            amt = _chip_amount(call_to_amount(table, agent_id))
+        mx = max_commit(table, agent_id)
+        if mx < 999999:
+            amt = min(_chip_amount(mx), amt)
+        body["amount"] = amt
+    return body
+
+
 def ensure_reasoning(reasoning: str, action: str, fallback: str = "") -> str:
     """Benchmark API requires non-empty `reasoning` on every action."""
     text = (reasoning or fallback or "").strip()
@@ -138,11 +184,11 @@ def build_action_payload(
     }
     amt = format_submission_amount(action, amount, table, agent_id)
     if amt > 0:
-        body["amount"] = round(amt, 2)
+        body["amount"] = _chip_amount(amt)
     chat = (message or reasoning or "").strip()
     if chat:
         body["message"] = chat[:200]
-    return body
+    return finalize_action_payload(body, table, agent_id)
 
 
 def self_test() -> list:
@@ -166,6 +212,11 @@ def self_test() -> list:
     payload_r = build_action_payload("t1", "raise", 22, table, "me")
     if payload_r.get("amount") != 22:
         errors.append(f"raise payload expected 22 got {payload_r.get('amount')}")
+    payload_frac = build_action_payload("t1", "raise", 4.6, table, "me")
+    if payload_frac.get("amount") != 22:
+        errors.append(
+            f"fractional raise should clamp to minRaiseTo 22 got {payload_frac.get('amount')}"
+        )
     payload_ai = build_action_payload("t1", "all-in", 0, table, "me")
     if payload_ai.get("amount") != 200:
         errors.append(f"all-in expected 200 got {payload_ai.get('amount')}")

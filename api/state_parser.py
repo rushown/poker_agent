@@ -126,6 +126,47 @@ def _normalize_table_snapshot(table: Dict[str, Any]) -> Dict[str, Any]:
     return table
 
 
+def prepare_table_for_runner(table: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize snapshot fields used by the polling loop (deadlines, ids)."""
+    out = _normalize_table_snapshot(dict(table))
+    if not out.get("actionDeadline") and not out.get("deadline"):
+        raw = out.get("actionDeadlineAt")
+        if raw is not None:
+            ts = float(raw)
+            out["actionDeadline"] = ts / 1000.0 if ts > 1e12 else ts
+    if not out.get("tableId") and out.get("id"):
+        out["tableId"] = out["id"]
+    return out
+
+
+def hero_is_to_act(table: Dict[str, Any], agent_id: str) -> bool:
+    """True when benchmark/pending snapshot shows it is our decision."""
+    acting = table.get("actingSeatNumber")
+    if acting is None:
+        acting = table.get("currentSeatNumber")
+    self_seat = table.get("selfSeatNumber")
+    if acting is not None and self_seat is not None:
+        if int(acting) != int(self_seat):
+            return False
+    else:
+        for seat in table.get("seats") or table.get("players") or []:
+            sid = seat.get("agentId") or seat.get("id") or ""
+            if sid == agent_id and str(seat.get("status", "")).lower() in (
+                "folded",
+                "out",
+                "eliminated",
+            ):
+                return False
+
+    aa = table.get("allowedActions")
+    if isinstance(aa, dict):
+        avail = aa.get("availableActions") or []
+        return bool(avail)
+    if isinstance(aa, list) and aa:
+        return True
+    return acting is not None and self_seat is not None
+
+
 def normalize_allowed_actions(raw: Any) -> List[Dict]:
     """Public wrapper for allowedActions dict → list."""
     return _normalize_allowed_actions(raw)

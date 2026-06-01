@@ -198,7 +198,7 @@ class ArenaClient:
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            timeout = aiohttp.ClientTimeout(total=10)
+            timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=25)
             self._session = aiohttp.ClientSession(timeout=timeout)
         return self._session
 
@@ -237,6 +237,16 @@ class ArenaClient:
                     continue
                 self._record_call(False, e.status)
                 raise
+            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                wait = self._parse_retry_after(None, attempt)
+                logger.warning(
+                    f"async GET {path} transport error ({type(e).__name__}), "
+                    f"retry in {wait:.1f}s"
+                )
+                if attempt < 3:
+                    await asyncio.sleep(wait + random.uniform(0.05, 0.25))
+                    continue
+                raise ArenaAPIError(503, f"async GET transport failed: {e!r}") from e
         if last_err:
             raise last_err
         raise ArenaAPIError(503, "async GET retries exhausted")
@@ -415,6 +425,49 @@ class ArenaClient:
         if isinstance(result, dict):
             return result.get("tables", [])
         return result or []
+
+    def fetch_action_tables(self, competition_id: str = "") -> List[Dict]:
+        """
+        Tables where we must act: pending-actions first, then benchmark snapshot.
+        Uses sync httpx (stable under load); normalizes action deadlines.
+        """
+        from api.state_parser import hero_is_to_act, prepare_table_for_runner
+
+        cid = competition_id or ""
+        if not cid:
+            raise ArenaAPIError(
+                400,
+                "competitionId required for GET /texas/pending-actions",
+            )
+
+        tables: List[Dict] = []
+        try:
+            raw = self.get_pending_actions(cid)
+            tables = [prepare_table_for_runner(t) for t in raw]
+        except ArenaAPIError:
+            raise
+
+        if tables:
+            return tables
+
+        try:
+            st = self.get_benchmark_status(cid)
+            tbl = st.get("table")
+            if tbl and hero_is_to_act(tbl, self._agent_id):
+                return [prepare_table_for_runner(tbl)]
+        except ArenaAPIError:
+            raise
+        except Exception as e:
+            logger.debug(f"benchmark status fallback skipped: {e!r}")
+
+        return []
+
+    async def async_fetch_action_tables(self, competition_id: str = "") -> List[Dict]:
+        """Poll via sync httpx in a thread pool — avoids aiohttp poll timeouts."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, lambda: self.fetch_action_tables(competition_id)
+        )
 
     def submit_action_payload(self, payload: Dict[str, Any]) -> Dict:
         """Submit pre-built body (must include tableId, action, reasoning)."""

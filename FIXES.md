@@ -17,7 +17,15 @@
 
 ### Watchdog false alarm
 - **Cause:** `waiting_user` phase has no actions; idle 60s triggered alert.
-- **Fix:** `record_action()` on empty poll cycles.
+- **Fix:** `record_action()` on empty poll cycles; skip watchdog when `phase=waiting_user`.
+
+### Poll timeouts (empty `Poll exception:`)
+- **Cause:** aiohttp `ClientTimeout` on `GET /texas/pending-actions`.
+- **Fix:** `async_fetch_action_tables()` uses sync httpx in thread pool; benchmark status fallback when pending is empty; bootstrap table on startup.
+
+### Fractional chip amounts (400 `{"error":"Error"}`)
+- **Cause:** Strategy sent `raise` 4.6 / `bet` 7.15; Arena expects integer `toAmount`.
+- **Fix:** `_chip_amount()`, `finalize_action_payload()` clamps to `minRaiseTo`/`raiseRange`; bet→raise when needed; 400 recovery via `_submit_safe_fallback()`.
 
 ## Run
 

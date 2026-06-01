@@ -85,6 +85,8 @@ class PokerRunner:
         self._table_locks: Dict[str, Lock] = {}
         self._action_tx_log: List[Dict[str, Any]] = []
         self._started_at = time.time()
+        self._bootstrap_table: Optional[Dict[str, Any]] = None
+        self._match_phase: str = ""
 
         self.tracker = OpponentTracker(settings.state_file)
         self.adaptive = AdaptiveMemory(settings.adaptive_state_file)
@@ -116,9 +118,15 @@ class PokerRunner:
         idle = time.time() - self.brutal.last_action_at
         degraded = (
             self.brutal.api_errors_400 > 0
-            or idle > settings.watchdog_idle_s
             or self.brutal.should_rollback()
         )
+        phase = (self._match_phase or "").lower()
+        if (
+            idle > settings.watchdog_idle_s
+            and phase not in ("waiting_user", "waiting", "")
+            and self._active_tables
+        ):
+            degraded = True
         brutal_h = self.brutal.health_dict()
         return {
             "status": brutal_h.get("status", "degraded" if degraded else "ok"),
@@ -189,9 +197,34 @@ class PokerRunner:
 
     def _watchdog_check(self) -> None:
         idle = time.time() - self.brutal.last_action_at
+        phase = (self._match_phase or "").lower()
+        if phase in ("waiting_user", "waiting"):
+            return
         if idle > settings.watchdog_idle_s and self._running:
             logger.warning(f"Watchdog: no action for {idle:.0f}s")
             self.brutal._alert(f"watchdog idle {idle:.0f}s")
+
+    def _poll_action_tables(self) -> List[Dict]:
+        return self.client.fetch_action_tables(self.competition_id)
+
+    async def _async_poll_action_tables(self) -> List[Dict]:
+        return await self.client.async_fetch_action_tables(self.competition_id)
+
+    def _consume_bootstrap_table(self, prev_states: dict) -> bool:
+        if not self._bootstrap_table:
+            return False
+        table = self._bootstrap_table
+        self._bootstrap_table = None
+        self._handle_table_sync(table, prev_states)
+        return True
+
+    async def _async_consume_bootstrap_table(self, prev_states: dict) -> bool:
+        if not self._bootstrap_table:
+            return False
+        table = self._bootstrap_table
+        self._bootstrap_table = None
+        await self._handle_table_async(table, prev_states)
+        return True
 
     def setup(self) -> bool:
         try:
@@ -215,7 +248,27 @@ class PokerRunner:
 
         self._load_payouts()
         self.meta.reset_match()
+        self._seed_bootstrap_table()
         return bool(self.competition_id)
+
+    def _seed_bootstrap_table(self) -> None:
+        """If benchmark already has our decision, act on first poll cycle."""
+        if not self.competition_id:
+            return
+        try:
+            from api.state_parser import hero_is_to_act, prepare_table_for_runner
+
+            st = self.client.get_benchmark_status(self.competition_id)
+            match = st.get("match") or {}
+            self._match_phase = str(match.get("phase") or "")
+            tbl = st.get("table")
+            if tbl and hero_is_to_act(tbl, self.client.agent_id):
+                self._bootstrap_table = prepare_table_for_runner(tbl)
+                logger.info(
+                    f"Bootstrap: hero to act on table {self._bootstrap_table.get('tableId')}"
+                )
+        except Exception as e:
+            logger.debug(f"Bootstrap table check skipped: {e!r}")
 
     def _rate_limit_poll(self) -> None:
         elapsed = time.time() - self._last_poll
@@ -237,6 +290,7 @@ class PokerRunner:
         try:
             st = self.client.get_benchmark_status(self.competition_id)
             match = st.get("match") or st
+            self._match_phase = str(match.get("phase") or "")
             hands = int(match.get("completedHands") or self.hands_played)
             target = int(match.get("targetHands") or 500)
             seats_alive = len(
@@ -303,11 +357,17 @@ class PokerRunner:
             self._refresh_match_context()
             self._watchdog_check()
             self._rate_limit_poll()
+            if self._consume_bootstrap_table(prev_states):
+                continue
             try:
-                tables = self.client.get_pending_actions(self.competition_id)
+                tables = self._poll_action_tables()
             except ArenaAPIError as e:
-                logger.warning(f"Poll error {e.status}")
+                logger.warning(f"Poll error {e.status}: {e.body}")
                 time.sleep(self.client._breaker.backoff_sleep())
+                continue
+            except Exception as e:
+                logger.warning(f"Poll exception: {type(e).__name__}: {e!r}")
+                time.sleep(settings.poll_interval_s)
                 continue
             if not tables:
                 self.brutal.record_action()
@@ -333,16 +393,16 @@ class PokerRunner:
             self._refresh_match_context()
             self._watchdog_check()
             await self._async_rate_limit_poll()
+            if await self._async_consume_bootstrap_table(prev_states):
+                continue
             try:
-                tables = await self.client.async_get_pending_actions(
-                    self.competition_id
-                )
+                tables = await self._async_poll_action_tables()
             except ArenaAPIError as e:
-                logger.warning(f"Poll error {e.status}")
+                logger.warning(f"Poll error {e.status}: {e.body}")
                 await asyncio.sleep(self.client._breaker.backoff_sleep())
                 continue
             except Exception as e:
-                logger.warning(f"Poll exception: {e}")
+                logger.warning(f"Poll exception: {type(e).__name__}: {e!r}")
                 await asyncio.sleep(settings.poll_interval_s)
                 continue
 
@@ -411,7 +471,14 @@ class PokerRunner:
         table_id = extract_table_id(table)
         async with self._table_lock(table_id):
             self._buffer_and_finalize(table, table_id, prev_states)
-            deadline = table.get("actionDeadline") or table.get("deadline") or 0
+            deadline = (
+                table.get("actionDeadline")
+                or table.get("deadline")
+                or 0
+            )
+            if not deadline and table.get("actionDeadlineAt"):
+                raw = float(table["actionDeadlineAt"])
+                deadline = raw / 1000.0 if raw > 1e12 else raw
         budget = settings.decision_budget_s
         if deadline:
             budget = min(budget, max(0.2, deadline - time.time() - 0.2))
@@ -581,11 +648,11 @@ class PokerRunner:
     def _submit_sync(
         self, table_id: str, action: str, amount: float, table: dict, chat: str
     ) -> None:
-        amount = format_submission_amount(
-            action, amount, table, self.client.agent_id
-        )
         if self.dry_run:
-            logger.info(f"[DRY-RUN] {action} {amount:.1f} | {chat[:80]}")
+            amt = format_submission_amount(
+                action, amount, table, self.client.agent_id
+            )
+            logger.info(f"[DRY-RUN] {action} {amt:.1f} | {chat[:80]}")
             return
         reasoning = (chat or "").strip() or (
             f"{self.arbiter.current_mode} | {self.meta.active} | {action}"
@@ -602,22 +669,71 @@ class PokerRunner:
         tx_id = f"{table_id}:{time.time():.3f}"
         self._action_tx_log.append({"id": tx_id, "payload": payload, "ts": time.time()})
         try:
-            self.client.submit_action_payload_safe(payload)
-            self.brutal.record_api_call(True, 200)
-            logger.info(f"✓ {action.upper()} {amount:.1f} | {chat[:80]}")
-            self.hands_played += 1
+            self._post_action_payload(payload, table_id, table)
         except ArenaAPIError as e:
             self.brutal.record_api_call(False, e.status)
-            logger.error(f"Submit failed {e.status}: {e.body}")
+            if e.status == 400:
+                self._submit_safe_fallback(table_id, table, chat, original_error=e)
+            else:
+                logger.error(f"Submit failed {e.status}: {e.body}")
+
+    def _post_action_payload(
+        self, payload: Dict[str, Any], table_id: str, table: dict
+    ) -> None:
+        self.client.submit_action_payload_safe(payload)
+        self.brutal.record_api_call(True, 200)
+        self.brutal.record_action()
+        act = str(payload.get("action", "fold")).upper()
+        amt = payload.get("amount", 0)
+        logger.info(f"✓ {act} {amt} | {str(payload.get('reasoning', ''))[:80]}")
+        self.hands_played += 1
+
+    def _submit_safe_fallback(
+        self,
+        table_id: str,
+        table: dict,
+        chat: str,
+        *,
+        original_error: Optional[ArenaAPIError] = None,
+    ) -> None:
+        """Recover from 400 by re-reading table state and playing a legal action."""
+        fresh = table
+        try:
+            for t in self.client.fetch_action_tables(self.competition_id):
+                if extract_table_id(t) == table_id:
+                    fresh = t
+                    break
+        except Exception:
+            pass
+        allowed = fresh.get("allowedActions") or []
+        action, amount = safe_fallback(allowed)
+        reasoning = (chat or "").strip() or "400 recovery safe action"
+        payload = build_action_payload(
+            table_id,
+            action,
+            amount,
+            fresh,
+            self.client.agent_id,
+            reasoning=reasoning,
+            message=reasoning,
+        )
+        try:
+            self._post_action_payload(payload, table_id, fresh)
+            logger.warning(
+                f"Recovered from 400 via {action} "
+                f"(was: {original_error.body if original_error else '?'})"
+            )
+        except ArenaAPIError as e2:
+            logger.error(f"Submit failed {e2.status} after 400 recovery: {e2.body}")
 
     async def _submit_async(
         self, table_id: str, action: str, amount: float, table: dict, chat: str
     ) -> None:
-        amount = format_submission_amount(
-            action, amount, table, self.client.agent_id
-        )
         if self.dry_run:
-            logger.info(f"[DRY-RUN] {action} {amount:.1f} | {chat[:80]}")
+            amt = format_submission_amount(
+                action, amount, table, self.client.agent_id
+            )
+            logger.info(f"[DRY-RUN] {action} {amt:.1f} | {chat[:80]}")
             return
         reasoning = (chat or "").strip() or (
             f"{self.arbiter.current_mode} | {self.meta.active} | {action}"
@@ -634,14 +750,22 @@ class PokerRunner:
         self._action_tx_log.append(
             {"id": f"{table_id}:{time.time():.3f}", "payload": payload, "ts": time.time()}
         )
+        loop = asyncio.get_running_loop()
         try:
-            await self.client.async_submit_action_payload_safe(payload)
-            self.brutal.record_api_call(True, 200)
-            logger.info(f"✓ {action.upper()} {amount:.1f} | {chat[:80]}")
-            self.hands_played += 1
+            await loop.run_in_executor(
+                None, lambda: self._post_action_payload(payload, table_id, table)
+            )
         except ArenaAPIError as e:
             self.brutal.record_api_call(False, e.status)
-            logger.error(f"Submit failed {e.status}: {e.body}")
+            if e.status == 400:
+                await loop.run_in_executor(
+                    None,
+                    lambda: self._submit_safe_fallback(
+                        table_id, table, chat, original_error=e
+                    ),
+                )
+            else:
+                logger.error(f"Submit failed {e.status}: {e.body}")
 
 
 def main():
