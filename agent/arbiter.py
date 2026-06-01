@@ -360,8 +360,10 @@ class StrategyArbiter:
             ehs=self._last_ehs,
             strategy_mode=mode.value,
         )
-        full_chat = f"{chat} {tilt} {mistake}".strip()[:200]
-        return action, amount, full_chat
+        full_chat = f"{chat} {tilt} {mistake}".strip()
+        if not full_chat:
+            full_chat = f"mode={mode.value} meta={meta_style} EHS={self._last_ehs:.0%} {action}"
+        return action, amount, full_chat[:500]
 
     def _safety_override(
         self, ctx: GameContext

@@ -112,24 +112,36 @@ def format_submission_amount(
     return amount
 
 
+def ensure_reasoning(reasoning: str, action: str, fallback: str = "") -> str:
+    """Benchmark API requires non-empty `reasoning` on every action."""
+    text = (reasoning or fallback or "").strip()
+    if not text:
+        text = f"Plutus {action}"
+    return text[:500]
+
+
 def build_action_payload(
     table_id: str,
     action: str,
     amount: float,
     table: Dict[str, Any],
     agent_id: str,
+    reasoning: str = "",
     message: str = "",
 ) -> Dict[str, Any]:
-    """Arena POST /texas/action body with toAmount-normalized amount."""
+    """Arena POST /texas/action body with toAmount + required reasoning."""
+    act = action.lower().replace("_", "-")
     body: Dict[str, Any] = {
         "tableId": table_id,
-        "action": action.lower().replace("_", "-"),
+        "action": act,
+        "reasoning": ensure_reasoning(reasoning, act, message),
     }
     amt = format_submission_amount(action, amount, table, agent_id)
     if amt > 0:
         body["amount"] = round(amt, 2)
-    if message:
-        body["message"] = message[:200]
+    chat = (message or reasoning or "").strip()
+    if chat:
+        body["message"] = chat[:200]
     return body
 
 
@@ -146,9 +158,11 @@ def self_test() -> list:
             "raiseRange": {"min": 22, "max": 200},
         },
     }
-    payload = build_action_payload("t1", "call", 11, table, "me")
+    payload = build_action_payload("t1", "call", 11, table, "me", reasoning="defend")
     if payload.get("amount") != 13:
         errors.append(f"call payload amount expected 13 got {payload.get('amount')}")
+    if not payload.get("reasoning"):
+        errors.append("reasoning required on payload")
     payload_r = build_action_payload("t1", "raise", 22, table, "me")
     if payload_r.get("amount") != 22:
         errors.append(f"raise payload expected 22 got {payload_r.get('amount')}")

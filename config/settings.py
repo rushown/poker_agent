@@ -21,8 +21,8 @@ class Settings(BaseSettings):
     credentials_file: str = ".arena-credentials"
     action_timeout_ms: int = 1700
     decision_budget_s: float = 1.5
-    poll_interval_s: float = 0.8
-    min_poll_interval_s: float = 0.5
+    poll_interval_s: float = 1.0
+    min_poll_interval_s: float = 0.55
     watchdog_idle_s: float = 60.0
     action_tx_log: str = ".arena-action-tx.json"
     log_level: str = "INFO"

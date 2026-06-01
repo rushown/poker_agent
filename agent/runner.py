@@ -119,8 +119,10 @@ class PokerRunner:
             or idle > settings.watchdog_idle_s
             or self.brutal.should_rollback()
         )
+        brutal_h = self.brutal.health_dict()
         return {
-            "status": "degraded" if degraded else "ok",
+            "status": brutal_h.get("status", "degraded" if degraded else "ok"),
+            "errors_last_100": brutal_h.get("errors_last_100", self.brutal.api_errors_400),
             "uptime_s": round(time.time() - self._started_at, 1),
             "strategy_version": STRATEGY_VERSION,
             "hands_played": self.hands_played,
@@ -308,6 +310,7 @@ class PokerRunner:
                 time.sleep(self.client._breaker.backoff_sleep())
                 continue
             if not tables:
+                self.brutal.record_action()
                 time.sleep(settings.poll_interval_s)
                 continue
             tables = sorted(
@@ -344,6 +347,7 @@ class PokerRunner:
                 continue
 
             if not tables:
+                self.brutal.record_action()
                 await asyncio.sleep(settings.poll_interval_s)
                 continue
 
@@ -583,13 +587,22 @@ class PokerRunner:
         if self.dry_run:
             logger.info(f"[DRY-RUN] {action} {amount:.1f} | {chat[:80]}")
             return
+        reasoning = (chat or "").strip() or (
+            f"{self.arbiter.current_mode} | {self.meta.active} | {action}"
+        )
         payload = build_action_payload(
-            table_id, action, amount, table, self.client.agent_id, chat
+            table_id,
+            action,
+            amount,
+            table,
+            self.client.agent_id,
+            reasoning=reasoning,
+            message=chat,
         )
         tx_id = f"{table_id}:{time.time():.3f}"
         self._action_tx_log.append({"id": tx_id, "payload": payload, "ts": time.time()})
         try:
-            self.client.submit_action_safe(table_id, action, amount, chat)
+            self.client.submit_action_payload_safe(payload)
             self.brutal.record_api_call(True, 200)
             logger.info(f"✓ {action.upper()} {amount:.1f} | {chat[:80]}")
             self.hands_played += 1
@@ -606,14 +619,23 @@ class PokerRunner:
         if self.dry_run:
             logger.info(f"[DRY-RUN] {action} {amount:.1f} | {chat[:80]}")
             return
+        reasoning = (chat or "").strip() or (
+            f"{self.arbiter.current_mode} | {self.meta.active} | {action}"
+        )
         payload = build_action_payload(
-            table_id, action, amount, table, self.client.agent_id, chat
+            table_id,
+            action,
+            amount,
+            table,
+            self.client.agent_id,
+            reasoning=reasoning,
+            message=chat,
         )
         self._action_tx_log.append(
             {"id": f"{table_id}:{time.time():.3f}", "payload": payload, "ts": time.time()}
         )
         try:
-            await self.client.async_submit_action_safe(table_id, action, amount, chat)
+            await self.client.async_submit_action_payload_safe(payload)
             self.brutal.record_api_call(True, 200)
             logger.info(f"✓ {action.upper()} {amount:.1f} | {chat[:80]}")
             self.hands_played += 1

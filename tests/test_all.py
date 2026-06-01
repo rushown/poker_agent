@@ -692,9 +692,10 @@ class TestActionPayload:
                 "allInToAmount": 200,
             },
         }
-        p = build_action_payload("t1", "call", 11, table, "me")
+        p = build_action_payload("t1", "call", 11, table, "me", reasoning="defend")
         assert p["amount"] == 13
         assert p["action"] == "call"
+        assert p.get("reasoning")
 
 
 class TestArbiterSafety:

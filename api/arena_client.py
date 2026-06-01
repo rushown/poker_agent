@@ -16,14 +16,15 @@ from api.error_window import RollingErrorWindow
 
 
 class ArenaAPIError(Exception):
-    def __init__(self, status: int, body: Any):
+    def __init__(self, status: int, body: Any, retry_after: float = 0.0):
         self.status = status
         self.body = body
+        self.retry_after = retry_after
         super().__init__(f"HTTP {status}: {body}")
 
 
 class CircuitBreaker:
-    def __init__(self, failure_threshold: int = 5, cooldown_s: float = 30.0):
+    def __init__(self, failure_threshold: int = 8, cooldown_s: float = 15.0):
         self.failure_threshold = failure_threshold
         self.cooldown_s = cooldown_s
         self._failures = 0
@@ -37,7 +38,10 @@ class CircuitBreaker:
         self._failures += 1
         if self._failures >= self.failure_threshold:
             self._open_until = time.time() + self.cooldown_s
-            logger.warning(f"Circuit breaker open for {self.cooldown_s}s")
+            logger.warning(
+                f"Circuit breaker open for {self.cooldown_s}s "
+                f"({self._failures} failures)"
+            )
 
     def allow(self) -> bool:
         if time.time() < self._open_until:
@@ -64,7 +68,7 @@ class ArenaClient:
         self._introspection: Optional[Dict] = None
         self._http = httpx.Client(timeout=timeout)
         self._breaker = CircuitBreaker()
-        self._error_window = RollingErrorWindow(window_s=60.0, max_rate=0.10)
+        self._error_window = RollingErrorWindow(window_s=60.0, max_rate=0.15)
         self._session: Optional[aiohttp.ClientSession] = None
 
     def _headers(self) -> Dict[str, str]:
@@ -76,7 +80,17 @@ class ArenaClient:
     def _url(self, path: str) -> str:
         return f"{self.base_url}/api/arena{path}"
 
-    def _handle_response(self, status: int, text: str, is_post: bool = False) -> Any:
+    @staticmethod
+    def _parse_retry_after(headers: Any, attempt: int) -> float:
+        raw = None
+        if headers is not None:
+            raw = headers.get("Retry-After") or headers.get("retry-after")
+        try:
+            return max(0.5, float(raw)) if raw else min(8.0, 0.5 * (2**attempt))
+        except (TypeError, ValueError):
+            return min(8.0, 0.5 * (2**attempt))
+
+    def _handle_response(self, status: int, text: str) -> Any:
         if status == 402:
             try:
                 body = json.loads(text)
@@ -89,6 +103,22 @@ class ArenaClient:
             return {}
         return json.loads(text)
 
+    def _should_trip_breaker(self, status: int) -> bool:
+        """Rate limits and conflicts should not open the circuit breaker."""
+        return status not in (409, 503, 429)
+
+    def _record_call(self, success: bool, status: int = 200) -> None:
+        if success:
+            self._error_window.record(True)
+            self._breaker.record_success()
+            return
+        if status in (503, 429):
+            self._error_window.record(False)
+            return
+        self._error_window.record(False)
+        if self._should_trip_breaker(status):
+            self._breaker.record_failure()
+
     def _check_error_window(self) -> None:
         if self._error_window.should_pause():
             raise ArenaAPIError(
@@ -96,44 +126,71 @@ class ArenaClient:
                 f"API error rate {self._error_window.error_rate():.0%} in 60s window",
             )
 
-    def _record_call(self, success: bool, status: int = 200) -> None:
-        self._error_window.record(success)
-        if success:
-            self._breaker.record_success()
-        else:
-            self._breaker.record_failure()
-
     def _get(self, path: str, params: Optional[Dict] = None) -> Any:
         self._check_error_window()
-        if not self._breaker.allow():
-            raise ArenaAPIError(503, "circuit breaker open")
-        try:
-            r = self._http.get(self._url(path), headers=self._headers(), params=params)
-            data = self._handle_response(r.status_code, r.text)
-            self._record_call(True)
-            return data
-        except ArenaAPIError as e:
-            self._record_call(False, e.status)
-            raise
-        except Exception:
-            self._record_call(False)
-            raise
+        last_err: Optional[ArenaAPIError] = None
+        for attempt in range(4):
+            if not self._breaker.allow():
+                raise ArenaAPIError(503, "circuit breaker open")
+            try:
+                r = self._http.get(
+                    self._url(path), headers=self._headers(), params=params
+                )
+                if r.status_code in (503, 429):
+                    wait = self._parse_retry_after(r.headers, attempt)
+                    logger.warning(f"GET {path} {r.status_code}, retry in {wait:.1f}s")
+                    time.sleep(wait + random.uniform(0.05, 0.25))
+                    last_err = ArenaAPIError(r.status_code, r.text, wait)
+                    continue
+                data = self._handle_response(r.status_code, r.text)
+                self._record_call(True)
+                return data
+            except ArenaAPIError as e:
+                last_err = e
+                if e.status in (503, 429) and attempt < 3:
+                    time.sleep(self._parse_retry_after(None, attempt))
+                    continue
+                self._record_call(False, e.status)
+                raise
+            except Exception:
+                self._record_call(False)
+                raise
+        if last_err:
+            raise last_err
+        raise ArenaAPIError(503, "GET retries exhausted")
 
     def _post(self, path: str, body: Dict) -> Any:
         self._check_error_window()
-        if not self._breaker.allow():
-            raise ArenaAPIError(503, "circuit breaker open")
-        try:
-            r = self._http.post(self._url(path), headers=self._headers(), json=body)
-            data = self._handle_response(r.status_code, r.text, is_post=True)
-            self._record_call(True)
-            return data
-        except ArenaAPIError as e:
-            self._record_call(False, e.status)
-            raise
-        except Exception:
-            self._record_call(False)
-            raise
+        last_err: Optional[ArenaAPIError] = None
+        for attempt in range(4):
+            if not self._breaker.allow():
+                raise ArenaAPIError(503, "circuit breaker open")
+            try:
+                r = self._http.post(
+                    self._url(path), headers=self._headers(), json=body
+                )
+                if r.status_code in (503, 429):
+                    wait = self._parse_retry_after(r.headers, attempt)
+                    logger.warning(f"POST {path} {r.status_code}, retry in {wait:.1f}s")
+                    time.sleep(wait + random.uniform(0.05, 0.25))
+                    last_err = ArenaAPIError(r.status_code, r.text, wait)
+                    continue
+                data = self._handle_response(r.status_code, r.text)
+                self._record_call(True)
+                return data
+            except ArenaAPIError as e:
+                last_err = e
+                if e.status in (503, 429) and attempt < 3:
+                    time.sleep(e.retry_after or self._parse_retry_after(None, attempt))
+                    continue
+                self._record_call(False, e.status)
+                raise
+            except Exception:
+                self._record_call(False)
+                raise
+        if last_err:
+            raise last_err
+        raise ArenaAPIError(503, "POST retries exhausted")
 
     def _patch(self, path: str, body: Dict) -> Any:
         r = self._http.patch(self._url(path), headers=self._headers(), json=body)
@@ -150,36 +207,74 @@ class ArenaClient:
             await self._session.close()
 
     async def async_get(self, path: str, params: Optional[Dict] = None) -> Any:
-        if not self._breaker.allow():
-            raise ArenaAPIError(503, "circuit breaker open")
-        session = await self._ensure_session()
-        try:
-            async with session.get(
-                self._url(path), headers=self._headers(), params=params
-            ) as resp:
-                text = await resp.text()
-                data = self._handle_response(resp.status, text)
-                self._breaker.record_success()
-                return data
-        except ArenaAPIError:
-            self._breaker.record_failure()
-            raise
+        last_err: Optional[ArenaAPIError] = None
+        for attempt in range(4):
+            if not self._breaker.allow():
+                raise ArenaAPIError(503, "circuit breaker open")
+            session = await self._ensure_session()
+            try:
+                async with session.get(
+                    self._url(path), headers=self._headers(), params=params
+                ) as resp:
+                    text = await resp.text()
+                    if resp.status in (503, 429):
+                        wait = self._parse_retry_after(resp.headers, attempt)
+                        logger.warning(
+                            f"async GET {path} {resp.status}, retry in {wait:.1f}s"
+                        )
+                        await asyncio.sleep(wait + random.uniform(0.05, 0.25))
+                        last_err = ArenaAPIError(resp.status, text, wait)
+                        continue
+                    data = self._handle_response(resp.status, text)
+                    self._record_call(True)
+                    return data
+            except ArenaAPIError as e:
+                last_err = e
+                if e.status in (503, 429) and attempt < 3:
+                    await asyncio.sleep(
+                        e.retry_after or self._parse_retry_after(None, attempt)
+                    )
+                    continue
+                self._record_call(False, e.status)
+                raise
+        if last_err:
+            raise last_err
+        raise ArenaAPIError(503, "async GET retries exhausted")
 
     async def async_post(self, path: str, body: Dict) -> Any:
-        if not self._breaker.allow():
-            raise ArenaAPIError(503, "circuit breaker open")
-        session = await self._ensure_session()
-        try:
-            async with session.post(
-                self._url(path), headers=self._headers(), json=body
-            ) as resp:
-                text = await resp.text()
-                data = self._handle_response(resp.status, text, is_post=True)
-                self._breaker.record_success()
-                return data
-        except ArenaAPIError:
-            self._breaker.record_failure()
-            raise
+        last_err: Optional[ArenaAPIError] = None
+        for attempt in range(4):
+            if not self._breaker.allow():
+                raise ArenaAPIError(503, "circuit breaker open")
+            session = await self._ensure_session()
+            try:
+                async with session.post(
+                    self._url(path), headers=self._headers(), json=body
+                ) as resp:
+                    text = await resp.text()
+                    if resp.status in (503, 429):
+                        wait = self._parse_retry_after(resp.headers, attempt)
+                        logger.warning(
+                            f"async POST {path} {resp.status}, retry in {wait:.1f}s"
+                        )
+                        await asyncio.sleep(wait + random.uniform(0.05, 0.25))
+                        last_err = ArenaAPIError(resp.status, text, wait)
+                        continue
+                    data = self._handle_response(resp.status, text)
+                    self._record_call(True)
+                    return data
+            except ArenaAPIError as e:
+                last_err = e
+                if e.status in (503, 429) and attempt < 3:
+                    await asyncio.sleep(
+                        e.retry_after or self._parse_retry_after(None, attempt)
+                    )
+                    continue
+                self._record_call(False, e.status)
+                raise
+        if last_err:
+            raise last_err
+        raise ArenaAPIError(503, "async POST retries exhausted")
 
     def save_credentials(self) -> None:
         with open(self.credentials_file, "w") as f:
@@ -214,6 +309,9 @@ class ArenaClient:
     def agent_id(self) -> str:
         return self._agent_id
 
+    def get_me(self) -> Dict:
+        return self._get("/agent/me")
+
     @property
     def is_authenticated(self) -> bool:
         return bool(self._api_key)
@@ -229,29 +327,14 @@ class ArenaClient:
     def get_competition(self, competition_id: str) -> Dict:
         return self._get("/competition", params={"competitionId": competition_id})
 
-    def parse_payouts(self, comp: Dict) -> Optional[List[float]]:
-        raw = comp.get("payouts") or comp.get("prizePool") or comp.get("prizes")
-        if not raw:
-            return None
-        if isinstance(raw, list):
-            out: List[float] = []
-            for p in raw:
-                if isinstance(p, (int, float)):
-                    out.append(float(p))
-                elif isinstance(p, dict):
-                    out.append(float(p.get("amount") or p.get("prize") or 0))
-            return out if out and sum(out) > 0 else None
-        return None
-
     def register(self, handle: str, name: str, quote: str = "") -> Dict:
-        result = self._post("/auth/register", {"handle": handle, "name": name, "quote": quote})
+        result = self._post(
+            "/auth/register", {"handle": handle, "name": name, "quote": quote}
+        )
         self._api_key = result.get("apiKey", "")
         self._agent_id = result.get("agentId", "")
         self.save_credentials()
         return result
-
-    def get_me(self) -> Dict:
-        return self._get("/agent/me")
 
     def get_leaderboard(self, competition_id: str) -> Any:
         return self._get(
@@ -267,6 +350,21 @@ class ArenaClient:
     def claim_invitation(self, redemption_id: str) -> Dict:
         return self._post(f"/agent/invitations/{redemption_id}/claim", {})
 
+    @staticmethod
+    def parse_payouts(comp: Dict) -> Optional[List[float]]:
+        raw = comp.get("payouts") or comp.get("prizePool") or comp.get("prizes")
+        if not raw:
+            return None
+        out: List[float] = []
+        if isinstance(raw, list):
+            for p in raw:
+                if isinstance(p, (int, float)):
+                    out.append(float(p))
+                elif isinstance(p, dict):
+                    out.append(float(p.get("amount") or p.get("prize") or 0))
+            return out if out and sum(out) > 0 else None
+        return None
+
     def get_wallet(self, chain: str = "monad") -> Dict:
         return self._get("/agent/wallet", params={"chain": chain})
 
@@ -277,22 +375,18 @@ class ArenaClient:
         )
 
     def join_table(self, competition_id: str = "", tx_hash: str = "") -> Dict:
-        body: Dict = {"competitionId": competition_id}
-        if not competition_id:
-            body = {}
+        body: Dict = {"competitionId": competition_id} if competition_id else {}
         if tx_hash:
             body["txHash"] = tx_hash
         return self._post("/texas/join", body)
 
     def start_benchmark(self, competition_id: str) -> Dict:
-        """POST /texas/benchmark/start — Poker Eval PVE (not matchmaking lobby)."""
         return self._post(
             "/texas/benchmark/start",
             {"competitionId": competition_id},
         )
 
     def get_benchmark_status(self, competition_id: str = "") -> Dict:
-        """GET /texas/benchmark/status — match progress (bb/100, hands, phase)."""
         params = {}
         if competition_id:
             params["competitionId"] = competition_id
@@ -322,28 +416,74 @@ class ArenaClient:
             return result.get("tables", [])
         return result or []
 
+    def submit_action_payload(self, payload: Dict[str, Any]) -> Dict:
+        """Submit pre-built body (must include tableId, action, reasoning)."""
+        if not payload.get("reasoning"):
+            from api.action_amount import ensure_reasoning
+
+            payload = dict(payload)
+            payload["reasoning"] = ensure_reasoning(
+                "", str(payload.get("action", "fold"))
+            )
+        return self._post("/texas/action", payload)
+
+    async def async_submit_action_payload(self, payload: Dict[str, Any]) -> Dict:
+        if not payload.get("reasoning"):
+            from api.action_amount import ensure_reasoning
+
+            payload = dict(payload)
+            payload["reasoning"] = ensure_reasoning(
+                "", str(payload.get("action", "fold"))
+            )
+        return await self.async_post("/texas/action", payload)
+
     def submit_action(
-        self, table_id: str, action: str, amount: float = 0, message: str = ""
+        self,
+        table_id: str,
+        action: str,
+        amount: float = 0,
+        reasoning: str = "",
+        message: str = "",
     ) -> Dict:
-        body: Dict = {"tableId": table_id, "action": action}
+        from api.action_amount import build_action_payload
+
+        payload = build_action_payload(
+            table_id,
+            action,
+            amount,
+            {"allowedActions": {}, "seats": []},
+            self._agent_id,
+            reasoning=reasoning,
+            message=message,
+        )
         if amount > 0:
-            body["amount"] = round(amount, 2)
-        if message:
-            body["message"] = message[:200]
-        return self._post("/texas/action", body)
+            payload["amount"] = round(amount, 2)
+        return self.submit_action_payload(payload)
 
     async def async_submit_action(
-        self, table_id: str, action: str, amount: float = 0, message: str = ""
+        self,
+        table_id: str,
+        action: str,
+        amount: float = 0,
+        reasoning: str = "",
+        message: str = "",
     ) -> Dict:
-        body: Dict = {"tableId": table_id, "action": action}
+        from api.action_amount import build_action_payload
+
+        payload = build_action_payload(
+            table_id,
+            action,
+            amount,
+            {"allowedActions": {}, "seats": []},
+            self._agent_id,
+            reasoning=reasoning,
+            message=message,
+        )
         if amount > 0:
-            body["amount"] = round(amount, 2)
-        if message:
-            body["message"] = message[:200]
-        return await self.async_post("/texas/action", body)
+            payload["amount"] = round(amount, 2)
+        return await self.async_submit_action_payload(payload)
 
     def get_hand_history(self, hand_id: str) -> Dict:
-        """Fetch completed hand if API exposes it."""
         for path in (
             f"/texas/hand/{hand_id}",
             "/texas/hand",
@@ -377,15 +517,24 @@ class ArenaClient:
         table_id: str,
         action: str,
         amount: float = 0,
+        reasoning: str = "",
         message: str = "",
         retries: int = 2,
     ) -> Optional[Dict]:
         for attempt in range(retries + 1):
             try:
-                return self.submit_action(table_id, action, amount, message)
+                return self.submit_action(
+                    table_id, action, amount, reasoning=reasoning, message=message
+                )
             except ArenaAPIError as e:
-                if e.status in (409, 400) and attempt < retries:
+                if e.status == 409 and attempt < retries:
                     self._retry_sleep(attempt)
+                    continue
+                if e.status == 400 and "reasoning" in str(e.body).lower():
+                    reasoning = reasoning or f"Plutus {action} mode={message[:40]}"
+                    continue
+                if e.status in (503, 429) and attempt < retries:
+                    time.sleep(e.retry_after or self._parse_retry_after(None, attempt))
                     continue
                 raise
         return None
@@ -395,15 +544,58 @@ class ArenaClient:
         table_id: str,
         action: str,
         amount: float = 0,
+        reasoning: str = "",
         message: str = "",
         retries: int = 2,
     ) -> Optional[Dict]:
         for attempt in range(retries + 1):
             try:
-                return await self.async_submit_action(table_id, action, amount, message)
+                return await self.async_submit_action(
+                    table_id, action, amount, reasoning=reasoning, message=message
+                )
             except ArenaAPIError as e:
-                if e.status in (409, 400) and attempt < retries:
+                if e.status == 409 and attempt < retries:
                     await self._async_retry_sleep(attempt)
+                    continue
+                if e.status == 400 and "reasoning" in str(e.body).lower():
+                    reasoning = reasoning or f"Plutus {action}"
+                    continue
+                if e.status in (503, 429) and attempt < retries:
+                    await asyncio.sleep(
+                        e.retry_after or self._parse_retry_after(None, attempt)
+                    )
+                    continue
+                raise
+        return None
+
+    def submit_action_payload_safe(
+        self, payload: Dict[str, Any], retries: int = 2
+    ) -> Optional[Dict]:
+        for attempt in range(retries + 1):
+            try:
+                return self.submit_action_payload(payload)
+            except ArenaAPIError as e:
+                if e.status == 409 and attempt < retries:
+                    self._retry_sleep(attempt)
+                    continue
+                if e.status in (503, 429) and attempt < retries:
+                    time.sleep(e.retry_after or 1.0)
+                    continue
+                raise
+        return None
+
+    async def async_submit_action_payload_safe(
+        self, payload: Dict[str, Any], retries: int = 2
+    ) -> Optional[Dict]:
+        for attempt in range(retries + 1):
+            try:
+                return await self.async_submit_action_payload(payload)
+            except ArenaAPIError as e:
+                if e.status == 409 and attempt < retries:
+                    await self._async_retry_sleep(attempt)
+                    continue
+                if e.status in (503, 429) and attempt < retries:
+                    await asyncio.sleep(e.retry_after or 1.0)
                     continue
                 raise
         return None

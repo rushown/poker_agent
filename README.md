@@ -45,6 +45,16 @@ Meta styles (`MANIAC`, `TAG`, `LAG`, `NIT`, `EXPLOIT`) rotate every 50 hands via
 - **Meta-learner** switches only when bootstrap p &lt; 0.1
 - **auto_train** reverts to `.arena-safe-config` if bb/100 &lt; 5 and writes `ISSUE.md`
 - Logs: JSON to `plutus.log` with `decision_time_ms`, `ehs`, `strategy_mode`, `action_taken`
+- **Benchmark actions** require `reasoning` in POST `/texas/action` (auto-filled from arbiter chat)
+
+## Troubleshooting
+
+| Error | Fix |
+|-------|-----|
+| `reasoning is required for benchmark actions` | Fixed in v4: every submit includes `reasoning` via `build_action_payload()` |
+| HTTP 503 / rate limit | Poll ≥550ms; client retries with `Retry-After` header |
+| Circuit breaker open | 503/429 no longer trip breaker; resets on next success |
+| `phase=waiting_user` | Benchmark idle — agent polls until a hand is dealt |
 
 ---
 

@@ -198,7 +198,10 @@ class BrutalSelfCheck:
 
     def health_dict(self) -> Dict[str, Any]:
         idle_s = time.time() - self.last_action_at
+        recent_400 = self.api_errors_400
         return {
+            "status": "ok" if self.api_errors_400 == 0 else "degraded",
+            "errors_last_100": recent_400,
             "brutal_check": "ok" if self.api_errors_400 == 0 else "degraded",
             "uptime_s": round(time.time() - self.started_at, 1),
             "api_400_errors": self.api_errors_400,
