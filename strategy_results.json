@@ -1,0 +1,133 @@
+{
+  "collected_at": "2026-06-02 05:54:38 UTC",
+  "agents": {
+    "S1": {
+      "strategy": "S1",
+      "description": "AggroValue \u2014 large pot-sized bets when ahead",
+      "name": "Plutus-AggroValue",
+      "agent_id": "cmpw1zhg70z6",
+      "competition_id": "seed_poker_eval_s1",
+      "hands_played": 215,
+      "target_hands": 500,
+      "raw_bb_per_100": -19.30232558139535,
+      "chip_delta": -83,
+      "status": "Running",
+      "error": null
+    },
+    "S2": {
+      "strategy": "S2",
+      "description": "AllInSpecialist \u2014 shove EHS>0.80, fold otherwise",
+      "name": "Plutus-AllIn",
+      "agent_id": "cmpw1zl4i0z7",
+      "competition_id": "seed_poker_eval_s1",
+      "hands_played": 223,
+      "target_hands": 500,
+      "raw_bb_per_100": 45.73991031390135,
+      "chip_delta": 204,
+      "status": "Running",
+      "error": null
+    },
+    "S3": {
+      "strategy": "S3",
+      "description": "BoardTexture \u2014 1.5x pot overbet when board pairs hole",
+      "name": "Plutus-BoardTex",
+      "agent_id": "cmpw1zow30yj",
+      "competition_id": "seed_poker_eval_s1",
+      "hands_played": 215,
+      "target_hands": 500,
+      "raw_bb_per_100": 4.418604651162791,
+      "chip_delta": 19,
+      "status": "Running",
+      "error": null
+    },
+    "S4": {
+      "strategy": "S4",
+      "description": "PurePotOdds \u2014 call/fold on pure equity math",
+      "name": "Plutus-PotOdds",
+      "agent_id": "cmpw1zspo0z0",
+      "competition_id": "seed_poker_eval_s1",
+      "hands_played": 229,
+      "target_hands": 500,
+      "raw_bb_per_100": -12.22707423580786,
+      "chip_delta": -56,
+      "status": "Running",
+      "error": null
+    },
+    "S5": {
+      "strategy": "S5",
+      "description": "PositionExploiter \u2014 wide IP, ultra-tight OOP",
+      "name": "Plutus-Position",
+      "agent_id": "cmpw1zwk70z0",
+      "competition_id": "seed_poker_eval_s1",
+      "hands_played": 229,
+      "target_hands": 500,
+      "raw_bb_per_100": -19.21397379912664,
+      "chip_delta": -88,
+      "status": "Running",
+      "error": null
+    },
+    "S6": {
+      "strategy": "S6",
+      "description": "Polarized3Bet \u2014 nuts or air only",
+      "name": "Plutus-Polarized",
+      "agent_id": "cmpw200pu0z7",
+      "competition_id": "seed_poker_eval_s1",
+      "hands_played": 212,
+      "target_hands": 500,
+      "raw_bb_per_100": -12.26415094339623,
+      "chip_delta": -52,
+      "status": "Running",
+      "error": null
+    },
+    "S7": {
+      "strategy": "S7",
+      "description": "SlowPlayTrap \u2014 check-raise monsters",
+      "name": "Plutus-Trap",
+      "agent_id": "cmpw204s20yk",
+      "competition_id": "seed_poker_eval_s1",
+      "hands_played": 222,
+      "target_hands": 500,
+      "raw_bb_per_100": 34.68468468468468,
+      "chip_delta": 154,
+      "status": "Running",
+      "error": null
+    },
+    "S8": {
+      "strategy": "S8",
+      "description": "ManiacPressure \u2014 80% open, constant pressure",
+      "name": "Plutus-Maniac",
+      "agent_id": "cmpw208g30z7",
+      "competition_id": "seed_poker_eval_s1",
+      "hands_played": 222,
+      "target_hands": 500,
+      "raw_bb_per_100": -61.26126126126125,
+      "chip_delta": -272,
+      "status": "Running",
+      "error": null
+    },
+    "S9": {
+      "strategy": "S9",
+      "description": "TightNit \u2014 top 12% hands, zero bluffs",
+      "name": "Plutus-TightNit",
+      "agent_id": "cmpw20cj40z9",
+      "competition_id": "seed_poker_eval_s1",
+      "hands_played": 213,
+      "target_hands": 500,
+      "raw_bb_per_100": -148.1220657276995,
+      "chip_delta": -631,
+      "status": "Running",
+      "error": null
+    }
+  },
+  "ranking": [
+    "S2",
+    "S7",
+    "S3",
+    "S4",
+    "S6",
+    "S5",
+    "S1",
+    "S8",
+    "S9"
+  ]
+}

@@ -32,6 +32,18 @@ def parse_card(c: str) -> Tuple[int, str]:
     return card_rank(c), card_suit(c)
 
 
+def hand_notation(hole: List[str]) -> str:
+    """['Ah','Kd'] -> 'AKo',  ['Qh','Qc'] -> 'QQ'"""
+    if len(hole) < 2:
+        return "??"
+    r1, r2 = card_rank(hole[0]), card_rank(hole[1])
+    s1, s2 = hole[0][1].lower(), hole[1][1].lower()
+    high, low = RANKS[max(r1, r2)], RANKS[min(r1, r2)]
+    if r1 == r2:
+        return high + high
+    return high + low + ("s" if s1 == s2 else "o")
+
+
 # ---------------------------------------------------------------------------
 # 5-card evaluator
 # ---------------------------------------------------------------------------

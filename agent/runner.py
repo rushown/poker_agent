@@ -31,7 +31,7 @@ from agent.session_learner import on_hand_complete
 from config.logging_setup import configure_logging
 from config.settings import settings
 from models.adaptive_memory import AdaptiveMemory
-from agent.ab_test import ABTestRunner
+
 from agent.brutal_check import BrutalSelfCheck
 from agent.decision_log import log_decision
 from agent.meta_learner import MetaLearner
@@ -92,7 +92,8 @@ class PokerRunner:
         self.adaptive = AdaptiveMemory(settings.adaptive_state_file)
         self.brutal = BrutalSelfCheck()
         self.meta = MetaLearner()
-        self.ab_test = ABTestRunner()
+        _strat = os.getenv("ARENA_STRATEGY", "").strip().upper() or "S10"
+        logger.info(f"Strategy: {_strat} | agent={settings.agent_name}")
         self.arbiter = StrategyArbiter(
             self.tracker, self.adaptive, self.meta, self.brutal
         )
@@ -156,10 +157,6 @@ class PokerRunner:
                 }
             ),
             "brutal": self.brutal.metrics_dict(),
-            "ab_tests": {
-                k: {"hands": v.hands, "bb_per_hand": v.bb_per_hand}
-                for k, v in self.ab_test._variants.items()
-            },
         }
 
     def _shutdown(self, *_):
@@ -176,7 +173,6 @@ class PokerRunner:
         self.adaptive.export_strategy_report()
         self.brutal.save()
         self.meta.save()
-        self.ab_test.save()
         self._save_action_tx_log()
         self._heartbeat_state.save()
         self._running = False
@@ -347,6 +343,7 @@ class PokerRunner:
 
     def _sync_run(self) -> None:
         prev_states: dict = {}
+        _503_streak = 0
         self._maybe_heartbeat(force=False)
         while self._running:
             if self.max_hands and self.hands_played >= self.max_hands:
@@ -361,9 +358,16 @@ class PokerRunner:
                 continue
             try:
                 tables = self._poll_action_tables()
+                _503_streak = 0
             except ArenaAPIError as e:
-                logger.warning(f"Poll error {e.status}: {e.body}")
-                time.sleep(self.client._breaker.backoff_sleep())
+                if e.status == 503:
+                    _503_streak += 1
+                    backoff = min(60.0, 2.0 ** min(_503_streak, 6))
+                    logger.warning(f"Poll 503 (streak {_503_streak}), backoff {backoff:.0f}s: {e.body}")
+                    time.sleep(backoff)
+                else:
+                    logger.warning(f"Poll error {e.status}: {e.body}")
+                    time.sleep(self.client._breaker.backoff_sleep())
                 continue
             except Exception as e:
                 logger.warning(f"Poll exception: {type(e).__name__}: {e!r}")
@@ -383,6 +387,7 @@ class PokerRunner:
 
     async def _async_run(self) -> None:
         prev_states: dict = {}
+        _503_streak = 0
         self._maybe_heartbeat(force=False)
         while self._running:
             if self.max_hands and self.hands_played >= self.max_hands:
@@ -397,9 +402,16 @@ class PokerRunner:
                 continue
             try:
                 tables = await self._async_poll_action_tables()
+                _503_streak = 0
             except ArenaAPIError as e:
-                logger.warning(f"Poll error {e.status}: {e.body}")
-                await asyncio.sleep(self.client._breaker.backoff_sleep())
+                if e.status == 503:
+                    _503_streak += 1
+                    backoff = min(60.0, 2.0 ** min(_503_streak, 6))
+                    logger.warning(f"Poll 503 (streak {_503_streak}), backoff {backoff:.0f}s: {e.body}")
+                    await asyncio.sleep(backoff)
+                else:
+                    logger.warning(f"Poll error {e.status}: {e.body}")
+                    await asyncio.sleep(self.client._breaker.backoff_sleep())
                 continue
             except Exception as e:
                 logger.warning(f"Poll exception: {type(e).__name__}: {e!r}")
@@ -674,6 +686,8 @@ class PokerRunner:
             self.brutal.record_api_call(False, e.status)
             if e.status == 400:
                 self._submit_safe_fallback(table_id, table, chat, original_error=e)
+            elif e.status == 409:
+                logger.warning(f"Table {table_id} no longer active (409), skipping action")
             else:
                 logger.error(f"Submit failed {e.status}: {e.body}")
 
@@ -764,6 +778,8 @@ class PokerRunner:
                         table_id, table, chat, original_error=e
                     ),
                 )
+            elif e.status == 409:
+                logger.warning(f"Table {table_id} no longer active (409), skipping action")
             else:
                 logger.error(f"Submit failed {e.status}: {e.body}")
 
@@ -795,6 +811,11 @@ def main():
         action="store_true",
         help="Send one owner heartbeat now",
     )
+    parser.add_argument(
+        "--list-strategies",
+        action="store_true",
+        help="Print all available ARENA_STRATEGY values and exit",
+    )
     args = parser.parse_args()
 
     configure_logging(
@@ -802,6 +823,11 @@ def main():
         json_logs=True,
         log_file=settings.log_file,
     )
+
+    if args.list_strategies:
+        from agent.strategies import list_strategies
+        print(list_strategies())
+        sys.exit(0)
 
     if not args.register and not args.list_competitions and not args.onboard and not args.heartbeat:
         run_startup_self_tests()

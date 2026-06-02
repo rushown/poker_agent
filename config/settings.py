@@ -38,5 +38,9 @@ class Settings(BaseSettings):
     auto_claim_invitations: bool = True
     decisions_log_file: str = "decisions.jsonl"
 
+    # Strategy override: S1-S9 for single fixed strategy, META for UCB1 learner,
+    # S10 or empty for the full GTO+exploit arbiter (default).
+    arena_strategy: str = ""
+
 
 settings = Settings()

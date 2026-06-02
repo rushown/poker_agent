@@ -1,31 +1,36 @@
-"""agent/arbiter.py — Strategy Arbiter with mode selection and meta-learning."""
+"""agent/arbiter.py — lean arbiter for the ADAPTIVE strategy.
+
+Decision flow (every hand):
+  1. Calculate EHS
+  2. Safety override (AA/KK/QQ — never fold premiums)
+  3. Push-fold (≤15BB preflop — Nash tables)
+  4. ADAPTIVE strategy (reads strategy_rules.json)
+  5. Emergency time-budget fallback
+"""
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.chat_tilt import build_chat_message, mistake_line
-from agent.early_game import EarlyGameAggressor
-from agent.endgame import EndgameModule
-from agent.exploit_strategies import get_exploit_action
-from agent.gto_bot import hand_notation, postflop_action, preflop_action
-from agent.meta_learner import MetaLearner
-from agent.strategy_modes import StrategyMode, StrategyModeSelector, TournamentContext
-from agent.strategy_styles import play_style
-from agent.techniques import (
-    calculate_fold_equity,
-    exploit_blend_threshold,
-    icm_bubble_threshold,
-    induce_bluff,
-    pot_odds_required,
-)
-from engine.ehs import calculate_ehs, clear_ehs_cache, ehs_to_bucket, samples_for_street
-from engine.icm import bubble_factor
+from agent.meta_learner import MetaLearner, NUMBERED_STRATEGIES
+from engine.ehs import calculate_ehs, clear_ehs_cache, samples_for_street
+from engine.hand_eval import hand_notation
 from engine.push_fold import should_call_push, should_push
 from models.adaptive_memory import AdaptiveMemory
-from models.bot_pattern_detector import BotPatternDetector, BotType
+from models.bot_pattern_detector import BotPatternDetector
 from models.opponent_tracker import OpponentTracker, OpponentStats
+
+
+def _pot_odds_required(call: float, pot: float) -> float:
+    return call / (call + pot) if (call + pot) > 0 else 0.0
+
+
+# Simple mode constants — no external dependency needed
+_MODE_GTO = "gto_balanced"
+_MODE_ICM = "icm_survival"
 
 
 @dataclass
@@ -64,22 +69,16 @@ class StrategyArbiter:
         self.meta = meta or MetaLearner()
         self.brutal = brutal_check
         self.detector = BotPatternDetector()
-        self.mode_selector = StrategyModeSelector(self.detector)
-        self.early = EarlyGameAggressor(tracker)
-        self.endgame = EndgameModule()
         self._hand_cache_key: Optional[str] = None
         self._last_ehs: float = 0.5
-        self._current_mode: StrategyMode = StrategyMode.GTO_BALANCED
+        self._current_mode: str = _MODE_GTO
         self.match_hands_played: int = 0
         self.target_hands: int = 500
         self.players_remaining: int = 6
+        raw = os.getenv("ARENA_STRATEGY", "").strip().upper()
+        self._strategy_override: str = raw if raw not in ("DEFAULT", "EXISTING", "") else "ADAPTIVE"
 
-    def set_match_context(
-        self,
-        hands_played: int,
-        target_hands: int = 500,
-        players_remaining: int = 6,
-    ) -> None:
+    def set_match_context(self, hands_played: int, target_hands: int = 500, players_remaining: int = 6) -> None:
         self.match_hands_played = hands_played
         self.target_hands = target_hands
         self.players_remaining = max(2, players_remaining)
@@ -92,424 +91,97 @@ class StrategyArbiter:
         if hand_number is not None:
             self.adaptive.start_hand(table_id, hand_number, stack)
 
-    def _stats_map(self, opponent_ids: List[str]) -> Dict[str, OpponentStats]:
-        return {oid: self.tracker.get(oid) for oid in opponent_ids}
-
     def decide(self, ctx: GameContext, deadline: float = 0.0) -> Tuple[str, float, str]:
         start = time.monotonic()
         budget = self._time_budget(start, deadline)
-        tuning = self.adaptive.tuning
 
-        samples = samples_for_street(ctx.street)
         ehs = calculate_ehs(
-            ctx.hole_cards,
-            ctx.community_cards,
-            samples=samples,
+            ctx.hole_cards, ctx.community_cards,
+            samples=samples_for_street(ctx.street),
             street=ctx.street,
             facing_raise=ctx.is_facing_raise or ctx.call_amount > ctx.bb_size,
         )
         self._last_ehs = ehs
-
-        stats_map = self._stats_map(ctx.opponent_ids)
-        for oid, st in stats_map.items():
-            self.detector.classify(st)
-        self.tracker.apply_bot_profiles(self.detector)
-
-        table_stats = self.tracker.table_weighted_stats(ctx.opponent_ids)
-        fold_to_3bet = table_stats.fold_to_3bet if table_stats.fold_to_3bet_opps > 3 else 0.5
-        fold_to_cbet = (
-            table_stats.fold_to_cbet_flop
-            if table_stats.fold_to_cbet_flop_opps > 3
-            else table_stats.fold_to_cbet
-        )
-        self.endgame.update_fold_to_3bet(fold_to_3bet)
-
         bb_depth = ctx.stack / max(1, ctx.bb_size)
-        avg_stack = sum(ctx.all_stacks) / max(1, len(ctx.all_stacks))
-        bf = 1.0
-        if ctx.payouts and len(ctx.payouts) > 1:
-            bf = bubble_factor(ctx.stack, ctx.all_stacks, ctx.payouts)
 
-        t_ctx = TournamentContext(
-            match_hands_played=self.match_hands_played,
-            target_hands=self.target_hands,
-            players_remaining=self.players_remaining,
-            bubble_factor=bf,
-            recent_win_rate=self.adaptive.recent_win_rate(),
-            bb_depth=bb_depth,
-            stack=ctx.stack,
-            avg_stack=avg_stack,
-        )
-        mode = self.mode_selector.select(
-            t_ctx, ctx.opponent_ids, stats_map, brutal_check=self.brutal
-        )
-        self._current_mode = mode
-        self.adaptive.set_strategy_mode(mode.value)
-
-        force_ctx: Dict[str, Any] = {"mode": mode.value}
-        if self.brutal and self.brutal._intimidation_aborted:
-            force_ctx["force_tag"] = True
-        meta_style = self.meta.select_strategy(force_ctx, table_stats.confidence)
-
+        # 1. Safety override — never fold AA/KK/QQ preflop
         safety = self._safety_override(ctx)
         if safety:
-            return self._finalize(ctx, *safety, mode, meta_style)
+            return self._finalize(ctx, *safety)
 
-        if self._over_budget(start, budget):
-            return self._finalize(ctx, *self._fast_fallback(ctx, ehs), mode, meta_style)
-
-        # --- Mode-specific fast paths ---
-        if mode == StrategyMode.INTIMIDATION and self.early.in_early_phase(
-            self.match_hands_played, self.target_hands
-        ):
-            early = self.early.decide(
-                ctx.hole_cards,
-                ctx.position,
-                ctx.stack,
-                ctx.bb_size,
-                ctx.pot,
-                ctx.is_facing_raise,
-                ctx.facing_raise_size,
-                ctx.allowed_actions,
-                ctx.opponent_ids,
-            )
-            if early:
-                return self._finalize(ctx, *early, mode, meta_style)
-
-        if mode == StrategyMode.ENDGAME_CLOSE:
-            eg = self.endgame.decide(
-                ctx.hole_cards,
-                ctx.position,
-                ctx.stack,
-                ctx.pot,
-                ctx.bb_size,
-                ctx.street,
-                ctx.is_facing_raise,
-                ctx.call_amount,
-                ehs,
-                ctx.allowed_actions,
-                ctx.is_in_position,
-            )
-            if eg:
-                return self._finalize(ctx, *eg, mode, meta_style)
-
+        # 2. Push-fold at short stacks
         if bb_depth <= 15 and ctx.street == "preflop":
-            pf = self._push_fold(ctx, ehs, bf * tuning.icm_tightness)
+            pf = self._push_fold(ctx, ehs)
             if pf:
-                return self._finalize(ctx, *pf, mode, meta_style)
+                return self._finalize(ctx, *pf)
 
-        if mode == StrategyMode.ICM_SURVIVAL and bf > icm_bubble_threshold(1.5, tuning):
-            if ctx.is_facing_raise and ehs < 0.55:
-                return self._finalize(ctx, "fold", 0, f"ICM survival BF={bf:.1f}", mode, meta_style)
+        # 3. Emergency time fallback
+        if self._over_budget(start, budget):
+            return self._finalize(ctx, *self._fast_fallback(ctx, ehs))
 
-        # --- Meta style layer (MANIAC/TAG/LAG/NIT/EXPLOIT) ---
-        if meta_style in ("MANIAC", "TAG", "LAG", "NIT"):
-            gto_action, gto_amount, gto_reason = play_style(
-                meta_style,
-                hole=ctx.hole_cards,
-                position=ctx.position,
-                street=ctx.street,
-                ehs=ehs,
-                pot=ctx.pot,
-                call_amount=ctx.call_amount,
-                stack=ctx.stack,
-                bb_size=ctx.bb_size,
-                is_facing_raise=ctx.is_facing_raise,
-                facing_raise_size=ctx.facing_raise_size,
-                is_in_position=ctx.is_in_position,
-                allowed_actions=ctx.allowed_actions,
-                fold_to_3bet=fold_to_3bet,
-                fold_to_cbet=fold_to_cbet,
-            )
-        elif meta_style == "EXPLOIT":
-            # EXPLOIT: immediately run the opponent-specific exploit logic
-            exploit_now = get_exploit_action(
-                stats=table_stats,
-                ehs=ehs,
-                pot=ctx.pot,
-                stack=ctx.stack,
-                street=ctx.street,
-                is_in_position=ctx.is_in_position,
-                allowed_actions=ctx.allowed_actions,
-                community=ctx.community_cards,
-            )
-            if exploit_now:
-                amount = self._clamp(exploit_now.amount, ctx.allowed_actions, ctx.stack)
-                return self._finalize(
-                    ctx, exploit_now.action, amount,
-                    f"{exploit_now.reasoning} | EXPLOIT meta",
-                    mode, meta_style,
-                )
-            # No exploit found — fall through to GTO
-            gto_action, gto_amount, gto_reason = self._gto_decision(ctx, ehs, fold_to_3bet, fold_to_cbet, tuning)
-        elif ctx.street == "preflop":
-            gto_action, gto_amount, gto_reason = preflop_action(
-                hole=ctx.hole_cards,
-                position=ctx.position,
-                is_facing_raise=ctx.is_facing_raise,
-                facing_raise_size=ctx.facing_raise_size,
-                bb_size=ctx.bb_size,
-                stack=ctx.stack,
-                pot=ctx.pot,
-                allowed_actions=ctx.allowed_actions,
-                fold_to_3bet_avg=fold_to_3bet,
-                tuning=tuning,
-            )
-        else:
-            board_texture = self._board_texture(ctx.community_cards)
-            gto_action, gto_amount, gto_reason = postflop_action(
-                ehs=ehs,
-                pot=ctx.pot,
-                call_amount=ctx.call_amount,
-                stack=ctx.stack,
-                street=ctx.street,
-                is_in_position=ctx.is_in_position,
-                allowed_actions=ctx.allowed_actions,
-                board_texture=board_texture,
-                fold_to_cbet=fold_to_cbet if fold_to_cbet_opps_ok(table_stats) else 0.45,
-                tuning=tuning,
-                opponent_af=table_stats.aggression_factor,
-            )
+        # 4. ADAPTIVE strategy decision
+        sid = self._strategy_override
+        from agent.strategies import route as _sr
+        try:
+            action, amount, reason = _sr(sid, ctx, ehs, bb_depth)
+        except Exception:
+            action, amount, reason = self._fast_fallback(ctx, ehs)
+        return self._finalize(ctx, action, amount, reason)
 
-        fold_eq = calculate_fold_equity(max(fold_to_3bet, table_stats.fold_to_steal))
-        can_check = any(a.get("action") == "check" for a in ctx.allowed_actions)
-        if induce_bluff(ehs, ctx.street, table_stats.aggression_factor, can_check):
-            return self._finalize(
-                ctx, "check", 0, f"Induce vs AF={table_stats.aggression_factor:.1f}", mode, meta_style
-            )
-
-        # Bot-pattern exploitation boost
-        if mode == StrategyMode.EXPLOITATION:
-            gto_action, gto_amount, gto_reason = self._apply_bot_exploit(
-                ctx, gto_action, gto_amount, gto_reason, ehs, stats_map, fold_eq
-            )
-
-        if ctx.payouts and bf > icm_bubble_threshold(1.5, tuning):
-            if gto_action in ("raise",) and ehs < 0.72:
-                return self._finalize(ctx, "fold", 0, f"ICM fold BF={bf:.1f}", mode, meta_style)
-            if gto_action == "call" and ehs < 0.55 and bf > icm_bubble_threshold(1.5, tuning) * 1.2:
-                return self._finalize(ctx, "fold", 0, f"ICM marginal fold BF={bf:.1f}", mode, meta_style)
-
-        blend_thresh = exploit_blend_threshold(self.adaptive, table_stats.confidence)
-        exploit = get_exploit_action(
-            stats=table_stats,
-            ehs=ehs,
-            pot=ctx.pot,
-            stack=ctx.stack,
-            street=ctx.street,
-            is_in_position=ctx.is_in_position,
-            allowed_actions=ctx.allowed_actions,
-            community=ctx.community_cards,
-        )
-        if exploit and table_stats.confidence >= blend_thresh - 0.15:
-            amount = self._clamp(exploit.amount, ctx.allowed_actions, ctx.stack)
-            chat = (
-                f"{exploit.reasoning} | mode={mode.value} meta={meta_style} "
-                f"EHS={ehs:.0%} FE={fold_eq:.0%}"
-            )
-            return self._finalize(ctx, exploit.action, amount, chat, mode, meta_style)
-
-        amount = self._clamp(gto_amount, ctx.allowed_actions, ctx.stack)
-        chat = (
-            f"{gto_reason} | mode={mode.value} meta={meta_style} "
-            f"EHS={ehs:.0%} [{ehs_to_bucket(ehs)}] BF={bf:.1f}"
-        )
-        return self._finalize(ctx, gto_action, amount, chat, mode, meta_style)
-
-    def _gto_decision(
-        self,
-        ctx: GameContext,
-        ehs: float,
-        fold_to_3bet: float,
-        fold_to_cbet: float,
-        tuning: Any,
-    ) -> Tuple[str, float, str]:
-        """Pure GTO path extracted for reuse by EXPLOIT fallback."""
-        if ctx.street == "preflop":
-            return preflop_action(
-                hole=ctx.hole_cards,
-                position=ctx.position,
-                is_facing_raise=ctx.is_facing_raise,
-                facing_raise_size=ctx.facing_raise_size,
-                bb_size=ctx.bb_size,
-                stack=ctx.stack,
-                pot=ctx.pot,
-                allowed_actions=ctx.allowed_actions,
-                fold_to_3bet_avg=fold_to_3bet,
-                tuning=tuning,
-            )
-        board_texture = self._board_texture(ctx.community_cards)
-        return postflop_action(
-            ehs=ehs,
-            pot=ctx.pot,
-            call_amount=ctx.call_amount,
-            stack=ctx.stack,
-            street=ctx.street,
-            is_in_position=ctx.is_in_position,
-            allowed_actions=ctx.allowed_actions,
-            board_texture=board_texture,
-            fold_to_cbet=fold_to_cbet,
-            tuning=tuning,
-            opponent_af=self.tracker.table_weighted_stats(ctx.opponent_ids).aggression_factor,
-        )
-
-    def _spr(self, ctx: GameContext) -> float:
-        """Stack-to-pot ratio — drives commitment decisions."""
-        return ctx.stack / max(1.0, ctx.pot)
-
-    def _apply_bot_exploit(
-        self,
-        ctx: GameContext,
-        action: str,
-        amount: float,
-        reason: str,
-        ehs: float,
-        stats_map: Dict[str, OpponentStats],
-        fold_eq: float,
-    ) -> Tuple[str, float, str]:
-        from models.bot_pattern_detector import BotType as BT
-        for oid in ctx.opponent_ids:
-            prof = self.detector.get_profile(oid)
-            if not prof or prof.confidence < 0.50:
-                continue
-
-            # Nit / scared money: steal wide in position
-            if prof.bot_type in (BT.NIT, BT.SCARED_MONEY):
-                if ctx.street == "preflop" and not ctx.is_facing_raise:
-                    if ctx.position in ("CO", "BTN", "SB") and fold_eq >= 0.55:
-                        return (
-                            "raise",
-                            min(ctx.stack, ctx.bb_size * 2.3),
-                            f"Steal vs {prof.bot_type.value} FE={fold_eq:.0%}",
-                        )
-                # Postflop: small cbet steal (they fold a lot)
-                if ctx.street in ("flop", "turn") and ctx.is_in_position and ehs < 0.45 and fold_eq >= 0.60:
-                    return (
-                        "raise",
-                        min(ctx.stack, ctx.pot * 0.35),
-                        f"Cbet steal vs {prof.bot_type.value} FE={fold_eq:.0%}",
-                    )
-
-            # Calling station: max value, never bluff
-            if prof.bot_type == BT.CALLING_STATION:
-                if ehs >= 0.58:
-                    return (
-                        "raise",
-                        min(ctx.stack, ctx.pot * 0.90),
-                        "Max value vs calling station",
-                    )
-                if ehs < 0.35 and action in ("raise",):
-                    return "check", 0, "No bluff vs calling station"
-
-            # Maniac: trap, let them bluff
-            if prof.bot_type == BT.MANIAC:
-                if ehs >= 0.80 and not ctx.is_in_position:
-                    can_check = any(a.get("action") == "check" for a in ctx.allowed_actions)
-                    if can_check:
-                        return "check", 0, "Trap maniac OOP — induce bluff"
-
-            # Range-static: 3-bet wide preflop (they don't adjust)
-            if prof.bot_type == BT.RANGE_STATIC:
-                if ctx.street == "preflop" and ctx.is_facing_raise and ehs >= 0.40:
-                    from agent.preflop_ranges import three_bet_size
-                    amt = three_bet_size(ctx.position, ctx.facing_raise_size, ctx.bb_size, ctx.stack)
-                    return "raise", amt, "3-bet range-static bot"
-
-        return action, amount, reason
-
-    def _finalize(
-        self,
-        ctx: GameContext,
-        action: str,
-        amount: float,
-        chat: str,
-        mode: StrategyMode,
-        meta_style: str,
-    ) -> Tuple[str, float, str]:
+    def _finalize(self, ctx: GameContext, action: str, amount: float, chat: str = "") -> Tuple[str, float, str]:
         if ctx.hand_number is not None and ctx.table_id:
-            req = pot_odds_required(ctx.call_amount, ctx.pot)
             self.adaptive.record_decision(
-                table_id=ctx.table_id,
-                hand_number=ctx.hand_number,
-                street=ctx.street,
-                action=action,
-                amount=amount,
-                ehs=self._last_ehs,
-                pot=ctx.pot,
-                call_amount=ctx.call_amount,
-                position=ctx.position,
-                required_equity=req,
-                notation=hand_notation(ctx.hole_cards),
-                stack=ctx.stack,
+                table_id=ctx.table_id, hand_number=ctx.hand_number, street=ctx.street,
+                action=action, amount=amount, ehs=self._last_ehs, pot=ctx.pot,
+                call_amount=ctx.call_amount, position=ctx.position,
+                required_equity=_pot_odds_required(ctx.call_amount, ctx.pot),
+                notation=hand_notation(ctx.hole_cards), stack=ctx.stack,
             )
         mistake = ""
         if ctx.hand_number and self.adaptive.mistakes.bad_calls > 0:
-            last = self.adaptive._pending.get(
-                self.adaptive.hand_key(ctx.table_id, ctx.hand_number), []
-            )
+            last = self.adaptive._pending.get(self.adaptive.hand_key(ctx.table_id, ctx.hand_number), [])
             if last and last[-1].mistake:
                 mistake = mistake_line()
         tilt = build_chat_message(
-            action=action,
-            won_big_pot=False,
+            action=action, won_big_pot=False,
             was_bluff=action in ("raise", "bet") and self._last_ehs < 0.35,
-            bubble_pressure=mode == StrategyMode.ICM_SURVIVAL,
-            ehs=self._last_ehs,
-            strategy_mode=mode.value,
+            bubble_pressure=False, ehs=self._last_ehs, strategy_mode=_MODE_GTO,
         )
-        # Strip internal strategic info from chat to avoid leaking reads to opponents
         safe_chat = tilt.strip() if tilt.strip() else action.upper()
         if mistake:
             safe_chat = f"{safe_chat} {mistake}".strip()
-        # Keep internal chat for logging only — return only safe public text
         return action, amount, safe_chat[:200]
 
-    def _safety_override(
-        self, ctx: GameContext
-    ) -> Optional[Tuple[str, float, str]]:
-        """Never fold premium preflop; fallback_to_gto guardrails."""
+    def _safety_override(self, ctx: GameContext) -> Optional[Tuple[str, float, str]]:
         notation = hand_notation(ctx.hole_cards)
         acts = {a.get("action", "").lower() for a in ctx.allowed_actions}
         if ctx.street == "preflop" and notation in ("AA", "KK", "QQ"):
             if ctx.is_facing_raise and "raise" in acts:
-                mx = ctx.stack
-                for a in ctx.allowed_actions:
-                    if a.get("action") in ("raise", "all-in"):
-                        mx = float(a.get("maxAmount", ctx.stack))
+                mx = max((float(a.get("maxAmount", ctx.stack)) for a in ctx.allowed_actions
+                          if a.get("action") in ("raise", "all-in")), default=ctx.stack)
                 return "raise", mx, f"Safety: never fold {notation}"
             if "raise" in acts and not ctx.is_facing_raise:
                 for a in ctx.allowed_actions:
                     if a.get("action") == "raise":
-                        return (
-                            "raise",
-                            float(a.get("minAmount", ctx.bb_size * 2)),
-                            f"Safety: open {notation}",
-                        )
+                        return "raise", float(a.get("minAmount", ctx.bb_size * 2)), f"Safety: open {notation}"
         return None
 
-    def _push_fold(
-        self, ctx: GameContext, ehs: float, icm_mult: float
-    ) -> Optional[Tuple[str, float, str]]:
+    def _push_fold(self, ctx: GameContext, ehs: float) -> Optional[Tuple[str, float, str]]:
         notation = hand_notation(ctx.hole_cards)
         bb_depth = ctx.stack / max(1, ctx.bb_size)
-        bf = icm_mult
-
         if ctx.is_facing_raise or ctx.call_amount > ctx.bb_size:
             to_call = ctx.call_to_amount or ctx.call_amount
-            if should_call_push(notation, bb_depth, bf) or ehs >= 0.58:
-                return "call", to_call, f"ICM call {notation}"
-            if ehs >= 0.52 and bf <= 1.3:
-                return "call", to_call, f"Call shove {notation}"
-            return "fold", 0, f"Fold vs shove {notation}"
-
+            if should_call_push(notation, bb_depth, 1.0) or ehs >= 0.58:
+                return "call", to_call, f"Push-fold call {notation}"
+            if ehs >= 0.52:
+                return "call", to_call, f"Push-fold call marginal {notation}"
+            return "fold", 0, f"Push-fold fold {notation}"
         if should_push(notation, ctx.position, bb_depth, ctx.is_facing_raise) or ehs >= 0.62:
             return "raise", ctx.stack, f"Push {notation} @ {bb_depth:.1f}BB"
         return "fold", 0, f"Push-fold fold {notation}"
 
     def _time_budget(self, start: float, deadline: float) -> float:
-        if deadline <= 0:
-            return 1.4
-        return max(0.15, deadline - time.time() - 0.25)
+        return max(0.15, deadline - time.time() - 0.25) if deadline > 0 else 1.4
 
     def _over_budget(self, start: float, budget: float) -> bool:
         return (time.monotonic() - start) > budget
@@ -517,30 +189,10 @@ class StrategyArbiter:
     def _fast_fallback(self, ctx: GameContext, ehs: float) -> Tuple[str, float, str]:
         acts = {a.get("action", "").lower() for a in ctx.allowed_actions}
         if "check" in acts:
-            return "check", 0, f"Time budget — check EHS={ehs:.0%}"
+            return "check", 0, f"Timeout check EHS={ehs:.0%}"
         if ehs > 0.5 and "call" in acts:
-            return "call", ctx.call_to_amount or ctx.call_amount, "Time budget — call"
-        return "fold", 0, "Time budget — fold"
-
-    def _board_texture(self, community: List[str]) -> str:
-        """Classify board as dry/wet/monotone/paired for bet-sizing decisions."""
-        if len(community) < 3:
-            return "dry"
-        from engine.hand_eval import card_rank, card_suit
-        suits = [card_suit(c) for c in community]
-        ranks = sorted(card_rank(c) for c in community)
-        # Monotone: all same suit (most dangerous for flush)
-        if len(set(suits)) == 1:
-            return "monotone"
-        # Paired board: one rank appears twice+ (set/boat dynamics)
-        if len(set(ranks)) < len(ranks):
-            return "paired"
-        # Wet: flush draw or straight draw possible
-        flush_draw = len(set(suits)) == 2
-        straight_draw = (max(ranks) - min(ranks)) <= 4 and len(set(ranks)) >= 3
-        if flush_draw or straight_draw:
-            return "wet"
-        return "dry"
+            return "call", ctx.call_to_amount or ctx.call_amount, "Timeout call"
+        return "fold", 0, "Timeout fold"
 
     def _clamp(self, amount: float, allowed_actions: List[Dict], stack: float) -> float:
         if amount <= 0:
@@ -554,8 +206,4 @@ class StrategyArbiter:
 
     @property
     def current_mode(self) -> str:
-        return self._current_mode.value
-
-
-def fold_to_cbet_opps_ok(stats: OpponentStats) -> bool:
-    return stats.fold_to_cbet_flop_opps > 3 or stats.fold_to_cbet_opps > 5
+        return self._current_mode

@@ -70,7 +70,7 @@ class TestHandEval:
         assert aa_board > kk_board  # AA pair > KK pair (same category, ace kicker)
 
     def test_hand_notation(self):
-        from agent.gto_bot import hand_notation
+        from engine.hand_eval import hand_notation
         assert hand_notation(["Ah", "Kd"]) == "AKo"
         assert hand_notation(["Ah", "Kh"]) == "AKs"
         assert hand_notation(["Ah", "Ac"]) == "AA"
@@ -208,71 +208,6 @@ class TestOpponentTracker:
         assert s.confidence > 0.88
 
 
-# ===========================================================================
-# GTO Bot Tests
-# ===========================================================================
-
-class TestGTOBot:
-    def test_aa_raises_preflop(self):
-        from agent.gto_bot import preflop_action
-        action, amount, reason = preflop_action(
-            hole=["Ah", "Ad"],
-            position="UTG",
-            is_facing_raise=False,
-            facing_raise_size=0,
-            bb_size=100,
-            stack=10000,
-            pot=150,
-            allowed_actions=[
-                {"action": "fold"}, {"action": "raise", "minAmount": 200, "maxAmount": 10000}
-            ],
-        )
-        assert action == "raise"
-        assert amount > 0
-
-    def test_72o_folds_utg(self):
-        from agent.gto_bot import preflop_action
-        action, _, _ = preflop_action(
-            hole=["7h", "2d"],
-            position="UTG",
-            is_facing_raise=False,
-            facing_raise_size=0,
-            bb_size=100,
-            stack=10000,
-            pot=150,
-            allowed_actions=[{"action": "fold"}, {"action": "raise", "minAmount": 200}],
-        )
-        assert action == "fold"
-
-    def test_postflop_value_bet(self):
-        from agent.gto_bot import postflop_action
-        action, amount, _ = postflop_action(
-            ehs=0.90,
-            pot=300,
-            call_amount=0,
-            stack=5000,
-            street="flop",
-            is_in_position=True,
-            allowed_actions=[
-                {"action": "check"},
-                {"action": "raise", "minAmount": 100, "maxAmount": 5000},
-            ],
-        )
-        assert action == "raise"
-        assert amount > 0
-
-    def test_postflop_fold_below_pot_odds(self):
-        from agent.gto_bot import postflop_action
-        action, _, _ = postflop_action(
-            ehs=0.15,
-            pot=300,
-            call_amount=200,  # need 40% equity to call
-            stack=5000,
-            street="river",
-            is_in_position=False,
-            allowed_actions=[{"action": "fold"}, {"action": "call", "amount": 200}],
-        )
-        assert action == "fold"
 
 
 # ===========================================================================
@@ -492,18 +427,6 @@ class TestHandBuffer:
         assert t.get("opp").pfr_count >= 1
 
 
-class TestPreflopFreq:
-    def test_aa_always_opens(self):
-        from agent.preflop_ranges import should_open
-        assert should_open("AA", "UTG") is True
-
-    def test_frequency_range(self):
-        from agent.preflop_ranges import open_frequency
-        # AJo UTG is a mixed-strategy hand (solver: ~70% open) — not always open
-        assert 0.5 <= open_frequency("AJo", "UTG") <= 1.0
-        assert open_frequency("AA", "BTN") == 1.0
-        # BTN opens wider than UTG
-        assert open_frequency("76s", "BTN") > open_frequency("76s", "UTG")
 
 
 class TestAdaptive:
@@ -517,14 +440,6 @@ class TestAdaptive:
         a.finish_hand("t1", 1, 9000, won=False, bb_size=100)
         assert a.tuning.call_threshold_adj > 0
         assert a.mistakes.bad_calls >= 1
-
-    def test_mdf_technique(self):
-        from agent.techniques import minimum_defense_frequency, should_defend_vs_bet
-        from models.adaptive_memory import StrategyTuning
-        mdf = minimum_defense_frequency(50, 100)
-        assert abs(mdf - 100 / 150) < 0.01
-        t = StrategyTuning()
-        assert should_defend_vs_bet(0.40, 50, 100, t) or True  # may defend with slack
 
     def test_persists_tuning(self):
         from models.adaptive_memory import AdaptiveMemory
@@ -607,29 +522,8 @@ class TestBotPatternDetector:
         assert p.bot_type in (BotType.NIT, BotType.SCARED_MONEY, BotType.UNKNOWN)
 
 
-class TestStrategyModes:
-    def test_early_intimidation(self):
-        from agent.strategy_modes import StrategyModeSelector, TournamentContext, StrategyMode
-
-        sel = StrategyModeSelector()
-        ctx = TournamentContext(match_hands_played=10, target_hands=500, bb_depth=50)
-        mode = sel.select(ctx, ["opp"], {})
-        assert mode == StrategyMode.INTIMIDATION
 
 
-class TestEarlyGame:
-    def test_top20_open(self):
-        from agent.early_game import EarlyGameAggressor
-        from models.opponent_tracker import OpponentTracker
-
-        eg = EarlyGameAggressor(OpponentTracker("/tmp/eg.json"))
-        assert eg.is_top20(["Ah", "Kd"])
-        acts = [{"action": "raise", "minAmount": 4, "maxAmount": 200}]
-        r = eg.decide(
-            ["Ah", "Kd"], "BTN", 200, 2, 3, False, 0, acts, []
-        )
-        assert r is not None
-        assert r[0] == "raise"
 
 
 class TestMetaLearner:
@@ -637,7 +531,8 @@ class TestMetaLearner:
         from agent.meta_learner import MetaLearner
 
         m = MetaLearner(state_file="/tmp/meta_test.json")
-        assert m.select_strategy() in ("MANIAC", "TAG", "LAG", "NIT", "EXPLOIT")
+        from agent.meta_learner import CORE_STRATEGIES, NUMBERED_STRATEGIES
+        assert m.select_strategy() in CORE_STRATEGIES + NUMBERED_STRATEGIES
         m.record_outcome("TAG", 50, True)
 
 

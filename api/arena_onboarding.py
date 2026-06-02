@@ -132,6 +132,18 @@ def claim_pending_invitations(client: ArenaClient) -> int:
     return claimed
 
 
+def _match_is_completed(match: Dict[str, Any]) -> bool:
+    st = str(match.get("status", "")).lower()
+    phase = str(match.get("phase", "")).lower()
+    if st in ("completed", "complete", "ended", "finished", "cancelled"):
+        return True
+    if phase in ("complete", "completed", "ended"):
+        return True
+    target = int(match.get("targetHands") or 0)
+    done = int(match.get("completedHands") or 0)
+    return target > 0 and done >= target
+
+
 def start_benchmark_match(client: ArenaClient, competition_id: str) -> Dict[str, Any]:
     """Start or resume Poker Eval benchmark; then poll pending-actions."""
     claim_pending_invitations(client)
@@ -141,6 +153,17 @@ def start_benchmark_match(client: ArenaClient, competition_id: str) -> Dict[str,
         if e.status == 409:
             logger.info("Benchmark match already exists — resuming via status endpoint")
             result = client.get_benchmark_status(competition_id)
+            existing = result.get("match") or {}
+            if _match_is_completed(existing):
+                logger.info("Previous benchmark completed — starting fresh match")
+                try:
+                    result = client.start_benchmark(competition_id)
+                except ArenaAPIError as e2:
+                    logger.warning(f"Fresh start failed ({e2.status}) — no active benchmark to play")
+                    raise RuntimeError(
+                        f"Benchmark '{competition_id}' is complete and cannot be restarted "
+                        f"(HTTP {e2.status}). Wait for a new competition or update ARENA_COMPETITION_ID."
+                    ) from e2
         elif e.status == 403:
             claim = client.get_claim_status()
             logger.error(f"Claim required: {claim.get('claimUrl', claim)}")

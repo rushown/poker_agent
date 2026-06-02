@@ -13,17 +13,13 @@ def _register_all() -> None:
         return
 
     from agent import brutal_check
-    from agent import ab_test
     from agent import meta_learner
-    from agent import endgame
     from models import bot_pattern_detector
     from api import action_amount
 
     MODULE_TESTS = [
         ("brutal_check", brutal_check.self_test),
-        ("ab_test", ab_test.ABTestRunner().self_test),
         ("meta_learner", meta_learner.self_test),
-        ("endgame", endgame.self_test),
         ("bot_pattern_detector", bot_pattern_detector.self_test),
         ("action_amount", action_amount.self_test),
     ]

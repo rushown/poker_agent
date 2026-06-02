@@ -1,0 +1,103 @@
+{
+  "version": 3,
+  "cycle": 3,
+  "cycle_notes": "v2->v3: 11 fixes from DeepSeek analysis of 552 decisions (83% fold rate). Loosened all entry/call/fold thresholds by 0.08. Added connector/broadway see-flop logic. Expected: fold rate 60-70%, +10 to +15 BB/100.",
+  "core_principle": "Only enter pots with the hand. When you have it, play it perfectly. When you do not, fold immediately. Exception: speculative hands (connectors, suited, broadway) get to see the flop before deciding.",
+  "preflop": {
+    "open_ip_min_ehs": 0.50,
+    "open_oop_min_ehs": 0.60,
+    "open_sizing_bb": 3.0,
+    "vs_raise_call_ip_min_ehs": 0.52,
+    "vs_raise_call_oop_min_ehs": 0.63,
+    "vs_raise_3bet_min_ehs": 0.67,
+    "vs_raise_3bet_sizing_mult": 3.0,
+    "speculative_hand_see_flop": {
+      "enabled": true,
+      "connector_gap_max": 2,
+      "suited_bonus_ehs": 0.04,
+      "broadway_min_rank": 10,
+      "broadway_see_flop_min_ehs": 0.45,
+      "connector_see_flop_min_ehs": 0.40,
+      "note": "Connectors (gap<=2) and broadway (rank>=T) get discounted EHS threshold to see the flop. Suited hands get +0.04 EHS bonus."
+    },
+    "reasoning": "Loosened from v2: open_ip 0.58->0.50, open_oop 0.68->0.60, call_ip 0.60->0.52, call_oop 0.71->0.63, 3bet 0.75->0.67. Fixes 83% fold rate. Connectors/broadway now see flop before folding."
+  },
+  "flop": {
+    "no_bet_value_min_ehs": 0.62,
+    "no_bet_value_sizing_pot": 0.75,
+    "no_bet_trap_min_ehs": 0.92,
+    "no_bet_board_hit_overbet_min_ehs": 0.63,
+    "no_bet_board_hit_overbet_pot": 1.5,
+    "facing_bet_raise_min_ehs": 0.83,
+    "facing_bet_raise_mult": 3.0,
+    "facing_bet_call_min_ehs": 0.47,
+    "facing_bet_fold_max_ehs": 0.40,
+    "bluff_enabled": false,
+    "reasoning": "call_min 0.55->0.47, fold_max 0.48->0.40. Fixes 41 bad flop folds. Value/raise thresholds unchanged (0 bad raises)."
+  },
+  "turn": {
+    "no_bet_value_min_ehs": 0.67,
+    "no_bet_value_sizing_pot": 0.8,
+    "no_bet_trap_min_ehs": 0.88,
+    "facing_bet_raise_min_ehs": 0.86,
+    "facing_bet_call_min_ehs": 0.47,
+    "facing_bet_fold_max_ehs": 0.44,
+    "bluff_enabled": false,
+    "reasoning": "call_min 0.55->0.47, fold_max 0.52->0.44. Consistent with flop loosening."
+  },
+  "river": {
+    "no_bet_value_min_ehs": 0.69,
+    "no_bet_value_sizing_pot": 0.75,
+    "facing_bet_raise_min_ehs": 0.88,
+    "facing_bet_call_min_ehs": 0.52,
+    "facing_bet_fold_max_ehs": 0.50,
+    "bluff_enabled": false,
+    "bluff_max_ehs": 0.2,
+    "bluff_sizing_pot": 0.5,
+    "reasoning": "call_min 0.60->0.52, fold_max 0.58->0.50. Reduces over-folding on river."
+  },
+  "adjustments": {
+    "ip_threshold_reduction": 0.04,
+    "oop_threshold_increase": 0.03,
+    "board_hit_overbet_enabled": true,
+    "trap_enabled": false,
+    "opponent_based_adjustments": {
+      "calling_stations": {
+        "threshold_modifier": -0.05,
+        "trap_disabled": true,
+        "bluff_disabled": true
+      },
+      "nits": {
+        "threshold_modifier": 0.0,
+        "trap_disabled": false,
+        "bluff_enabled": true
+      }
+    }
+  },
+  "aggression": {
+    "river_allin_min_ehs": 0.90,
+    "large_bet_min_ehs": 0.78,
+    "large_bet_pot_mult": 1.2,
+    "medium_bet_min_ehs": 0.65,
+    "medium_bet_pot_mult": 0.75,
+    "flop_raise_aggressive_min_ehs": 0.85,
+    "note": "Tiered bet sizing by EHS. Near-certain win (>=0.90) -> all-in. Highly likely (>=0.78) -> 1.2x pot. Likely (>=0.65) -> 0.75x pot. Set by DeepSeek EV simulation each cycle."
+  },
+  "history_review": {
+    "enabled": true,
+    "regret_threshold_bad_fold_ehs": 0.58,
+    "regret_threshold_missed_value_ehs": 0.72,
+    "regret_threshold_bad_raise_ehs": 0.38,
+    "note": "DeepSeek reviews hand history each cycle: did the action taken win/lose, would opposite action have won? Changes are only made when regret count exceeds 10 per category."
+  },
+  "constraints": [
+    "NEVER raise or bet without EHS meeting the minimum for that street",
+    "NEVER call if pot odds require equity we do not have",
+    "NEVER bluff unless bluff_enabled=true AND specific conditions are met",
+    "ALWAYS play trap (check then check-raise) with EHS above trap threshold",
+    "ALWAYS overbet when board pairs our hole cards and EHS above board_hit threshold",
+    "ALWAYS value bet directly when EHS is above value threshold, even if trap threshold is also exceeded, unless opponent is confirmed aggressive",
+    "ALWAYS give connectors (gap<=2) and broadway (rank>=T) a chance to see the flop before folding — use speculative_hand_see_flop thresholds",
+    "NEVER fold a speculative hand preflop without first checking if it qualifies for the see-flop bonus"
+  ]
+}

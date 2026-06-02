@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from agent.gto_bot import hand_notation
+from engine.hand_eval import hand_notation
 
 
 @dataclass

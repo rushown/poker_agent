@@ -19,7 +19,12 @@ from agent.brutal_check import bootstrap_improvement_significant
 from loguru import logger
 
 
-STRATEGIES = ("MANIAC", "TAG", "LAG", "NIT", "EXPLOIT")
+# Core meta-strategies for the default arbiter.
+CORE_STRATEGIES = ("MANIAC", "TAG", "LAG", "NIT", "EXPLOIT")
+# All numbered strategies registered in agent/strategies/.
+NUMBERED_STRATEGIES = ("ADAPTIVE",)
+# Full pool: META mode uses all; default mode uses CORE only.
+STRATEGIES = CORE_STRATEGIES + NUMBERED_STRATEGIES
 
 
 @dataclass
@@ -93,14 +98,19 @@ class MetaLearner:
         before = list(self._hand_deltas_by_strategy.get(self.active, []))[-100:]
         after = list(self._hand_deltas_by_strategy.get(candidate, []))[-100:]
 
-        significant, p_val = validate_performance(before, after)
+        # Only force exploration when candidate has zero recorded data (bootstrap requires samples)
+        force_explore = candidate != self.active and len(after) == 0
+        if force_explore:
+            significant, p_val = True, 0.0
+        else:
+            significant, p_val = validate_performance(before, after)
+
         old = self.active
         if significant and candidate != self.active:
             self.previous_safe = self.active
             self.active = candidate
-            logger.info(
-                f"Meta switch {old} -> {candidate} (bootstrap p={p_val:.3f})"
-            )
+            reason = "forced explore" if force_explore else f"bootstrap p={p_val:.3f}"
+            logger.info(f"Meta switch {old} -> {candidate} ({reason})")
         else:
             logger.info(
                 f"Meta keep {self.active} (candidate {candidate} not significant p={p_val:.3f})"
@@ -144,7 +154,7 @@ class MetaLearner:
                 best_ucb1 = ucb1
                 best_name = s
 
-        # Only switch if meaningful improvement (> 0.5 bb/100 over current)
+        # Switch only if meaningful improvement (> 0.5 bb/100 over current avg)
         current_hist = self._history[self.active]
         current_avg = sum(current_hist) / max(1, len(current_hist)) if current_hist else -1e9
         if best_name == self.active or best_ucb1 < current_avg + 0.5:

@@ -1,8 +1,11 @@
-"""agent/session_learner.py — post-hand review hook (delegates to AdaptiveMemory)."""
+"""agent/session_learner.py — post-hand review hook + rich hand outcome logging."""
 from __future__ import annotations
 
+import json
+import time
 from typing import Any, Dict, List, Optional
 
+from loguru import logger
 from models.adaptive_memory import AdaptiveMemory
 
 
@@ -69,6 +72,69 @@ def on_hand_complete(
             pfr=False,
             won=won,
         )
+
+    # Rich hand outcome event — parsed by cycle_engine for opponent modeling
+    _log_hand_outcome(
+        table_id=table_id,
+        hand_number=hand_number,
+        my_agent_id=my_agent_id,
+        prev_table=prev_table,
+        current_table=current_table,
+        delta=delta,
+        won=won,
+        bb=bb,
+    )
+
+
+def _log_hand_outcome(
+    table_id: str,
+    hand_number: Any,
+    my_agent_id: str,
+    prev_table: Dict,
+    current_table: Dict,
+    delta: float,
+    won: Optional[bool],
+    bb: float,
+) -> None:
+    """Emit a structured hand_outcome event for cycle_engine analysis."""
+    seats = prev_table.get("seats") or prev_table.get("players") or []
+    my_seat = next((s for s in seats if (s.get("agentId") or s.get("id","")) == my_agent_id), {})
+    hole = my_seat.get("holeCards") or my_seat.get("cards") or []
+    board = (current_table.get("communityCards") or current_table.get("boardCards")
+             or prev_table.get("communityCards") or prev_table.get("boardCards") or [])
+
+    # Opponent actions this hand (from prev_table action history if available)
+    opp_actions = []
+    for s in seats:
+        aid = s.get("agentId") or s.get("id", "")
+        if aid == my_agent_id:
+            continue
+        opp_actions.append({
+            "id": aid,
+            "stack": float(s.get("stack") or s.get("stackChips") or 0),
+            "status": s.get("status", ""),
+        })
+
+    winners = current_table.get("winners") or prev_table.get("winners") or []
+    winner_ids = [w.get("agentId") or w.get("winnerId","") for w in winners]
+    pot = float(prev_table.get("pot") or prev_table.get("potChips") or 0)
+
+    payload = {
+        "event": "hand_outcome",
+        "ts": time.time(),
+        "table_id": table_id,
+        "hand_number": hand_number,
+        "hole_cards": hole,
+        "board_cards": board,
+        "pot": pot,
+        "chip_delta": round(delta, 2),
+        "bb_size": bb,
+        "bb_delta": round(delta / max(1, bb), 2),
+        "won": won,
+        "winner_ids": winner_ids,
+        "opponents": opp_actions,
+    }
+    logger.info(json.dumps(payload))
 
 
 def _my_stack(seats: List[Dict], agent_id: str) -> Optional[float]:
