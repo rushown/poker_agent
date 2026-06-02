@@ -306,120 +306,244 @@ def multi_agent_pipeline(
     """
     rules_str  = json.dumps(rules, indent=2)
     stats_str  = json.dumps(stats, indent=2)
-    cross_str  = json.dumps(cross_version_mistakes[:30], indent=2)
-    folds_str  = json.dumps(bad_fold_samples[:20], indent=2)
+    cross_str  = json.dumps(cross_version_mistakes[:40], indent=2)
+    folds_str  = json.dumps(bad_fold_samples[:10], indent=2)   # smaller batch to avoid truncation
 
-    # ── Stage 1A: Poker theory research ──────────────────────────────
+    # Infer opponent patterns from all available logs
+    log_files = all_log_files or [
+        f"/home/ocean/vscode/plutus-agents/v{v}/run.log" for v in range(1, 7)
+    ]
+    opp_patterns = _infer_opponent_patterns(log_files)
+    opp_str = json.dumps(opp_patterns, indent=2)
+
+    # ── Stage 1A: Poker theory + strong/weak aspect audit ────────────
     theory_prompt = f"""
-Research task: optimal EHS thresholds for a 6-max NLH bot playing vs other bots (not humans).
+Research task: optimal EHS thresholds for a 6-max NLH bot vs pokerbench-style bots.
 
 CONTEXT:
-- Our bot uses EHS (Effective Hand Strength) as its primary decision metric
-- Current performance: {stats.get('action_pcts', {})} action distribution, fold rate {stats.get('action_pcts', {}).get('fold', '?')}%
-- We are playing vs bot opponents on a benchmark platform
+- Our bot uses EHS (Effective Hand Strength, range 0-1) as its primary decision metric
+- Current performance: fold={stats.get('action_pcts',{}).get('fold','?')}%, raise={stats.get('action_pcts',{}).get('raise','?')}%, call={stats.get('action_pcts',{}).get('call','?')}%
+- We play exclusively vs automated pokerbench bots (equity-based, rarely bluff, pot-odds callers)
 
-RESEARCH QUESTIONS (draw on your full knowledge of poker theory):
-1. What is the academically correct EHS threshold for preflop opens in 6-max? What does GTO research say?
-2. For postflop: what EHS values separate value bets, checks, and folds on flop/turn/river?
-3. For bot vs bot play specifically: how do optimal strategies differ from human-facing GTO?
-   (bots don't tilt, don't make emotional decisions — what exploits work vs bots?)
-4. What EHS threshold makes a river all-in +EV vs a calling station bot? Show the pot odds math.
-5. For connectors (3-4, 5-6) and broadway (Q-K, J-Q): what is the correct preflop open frequency
-   in terms of EHS, and why do they have different value than their raw EHS suggests?
-6. What betting sizes maximize EV when EHS is 0.80-0.90 vs 0.90+ on each street?
+STRONG ASPECTS OF CURRENT RULES (do not regress these):
+- avg_ehs_fold={stats.get('avg_ehs_fold','?')} — folding genuinely weak hands correctly
+- avg_ehs_raise={stats.get('avg_ehs_raise','?')} — raising with reasonable equity
+- Aggression tiers: all-in ≥0.90, large-bet ≥0.78, medium-bet ≥0.65 (new in v4)
+- Connector/broadway see-flop logic (new in v3)
+- Pot-odds call layer (new in v4)
 
-CURRENT RULES TO EVALUATE:
-{rules_str}
+WEAK ASPECTS TO RESEARCH:
+- bad_folds={stats.get('regret_counts',{}).get('bad_folds','?')} — still folding some profitable hands
+- missed_value={stats.get('regret_counts',{}).get('missed_value','?')} — checking when should bet
+- Opponent counter-strategy unknown (we don't know call/fold frequencies of pokerbench bots)
 
-Return JSON:
-{{
-  "preflop_optimal_thresholds": {{"open_ip": 0.0, "open_oop": 0.0, "call_ip": 0.0, "call_oop": 0.0, "rationale": ""}},
-  "postflop_optimal_thresholds": {{"flop_value": 0.0, "flop_fold": 0.0, "turn_value": 0.0, "river_value": 0.0, "river_allin": 0.0, "rationale": ""}},
-  "bot_vs_bot_exploits": ["exploit1", "exploit2", "exploit3"],
-  "connector_broadway_value": "explanation of why these hands have implied odds beyond raw EHS",
-  "aggressive_sizing_by_ehs": {{
-    "ehs_0.90_plus": "sizing recommendation with math",
-    "ehs_0.78_to_0.90": "sizing recommendation",
-    "ehs_0.65_to_0.78": "sizing recommendation"
-  }},
-  "current_rules_verdict": "assessment of what is correct and what needs changing"
-}}
-"""
-
-    # ── Stage 1B: Cross-version mistake pattern analysis ──────────────
-    pattern_prompt = f"""
-Analyze mistake patterns across multiple versions of a poker bot.
-
-CROSS-VERSION MISTAKE DATA:
-{cross_str}
-
-CURRENT VERSION ({version}) STATS:
-{stats_str}
-
-TASK: Find PATTERNS across versions, not just individual mistakes.
-- Which mistake categories keep recurring across v1, v2, v3?
-- Which fixes from previous cycles actually worked (mistake count dropped)?
-- Which rules are STILL too tight despite previous loosening?
-- Are there systematic biases (always over-folding specific streets? always bad OOP?)?
-
-For each recurring pattern, compute: how many hands did we lose because of it, what is the total EV cost?
-
-Return JSON:
-{{
-  "recurring_patterns": [
-    {{"pattern": "description", "versions_affected": ["v1","v2","v3"], "frequency": 0, "total_ev_cost_chips": 0, "root_cause_field": "section.key", "recommended_fix": "specific change"}}
-  ],
-  "fixes_that_worked": ["description of what improved between versions"],
-  "still_broken": ["what is still wrong despite previous fixes"],
-  "priority_order": ["field1 — fix this first because X", "field2 — second because Y"]
-}}
-"""
-
-    # ── Stage 1C: EV simulator ────────────────────────────────────────
-    sim_prompt = f"""
-You are an EV simulation engine. Replay these bad fold decisions with alternative actions.
-
-BAD FOLDS (hands where we folded with EHS > 0.58):
-{folds_str}
+RESEARCH QUESTIONS (use full academic knowledge):
+1. For 6-max NLH vs equity-based bots: what is the correct open-raise frequency?
+   Express as EHS threshold AND as % of hands (e.g. "top 30% of hands = EHS >= 0.48").
+2. Pokerbench bots call with pot-odds math. If we bet 75% pot, they need 75/(75+100)=43% equity.
+   What is the EHS range of hands we should bet for VALUE vs such a bot (they call with 43%+ equity)?
+3. What is the correct river all-in frequency vs a pot-odds bot?
+   If bot calls all-ins with EHS >= 50% (breakeven), our EV of all-in = EHS*(2*pot) - (1-EHS)*pot.
+   At what EHS does this become +EV vs checking?
+4. STRONG/WEAK AUDIT of current rules — for each field in the rules, state if it is:
+   a) CORRECT (within GTO range for this game type)
+   b) TOO TIGHT (causing missed value or unnecessary folds)
+   c) TOO LOOSE (causing bad calls or bad raises)
 
 CURRENT RULES:
 {rules_str}
 
-For each bad fold, simulate:
-1. EV of folding (always 0 — we fold and lose nothing more)
-2. EV of calling instead: EV_call = EHS * pot - (1 - EHS) * call_amount
-3. EV delta: EV_call - EV_fold
-4. Which specific rule caused the fold (which threshold was violated)?
-
-Also simulate the RIVER ALL-IN scenario:
-- If EHS = 0.90 and pot = 100, what is EV of all-in vs check?
-  EV_allin = P(villain_calls) * [EHS * (pot + their_call) - (1-EHS) * allin_size] + P(villain_folds) * pot
-  Assume villain call frequency = 40% (typical bot calling range)
-
 Return JSON:
 {{
-  "fold_simulations": [
-    {{"hand": 0, "ehs": 0.0, "ev_fold": 0, "ev_call": 0.0, "ev_delta": 0.0, "rule_violated": "section.key", "threshold_was": 0.0, "threshold_should_be": 0.0}}
+  "optimal_open_pct": 0.0,
+  "optimal_open_ehs": 0.0,
+  "value_bet_vs_potodds_bot": {{"min_ehs": 0.0, "sizing_pct_pot": 0.0, "math": ""}},
+  "river_allin_breakeven_ehs": 0.0,
+  "river_allin_optimal_ehs": 0.0,
+  "strong_aspects": ["field: why it is correct"],
+  "weak_aspects": [
+    {{"field": "section.key", "issue": "too_tight/too_loose", "recommended_value": 0.0, "math": ""}}
   ],
-  "river_allin_ev_analysis": {{
-    "ehs_0.90_pot_100": {{"ev_allin": 0.0, "ev_check": 0.0, "verdict": ""}},
-    "ehs_0.85_pot_100": {{"ev_allin": 0.0, "ev_check": 0.0, "verdict": ""}},
-    "recommended_allin_threshold": 0.0,
-    "recommended_large_bet_threshold": 0.0
-  }},
-  "total_ev_recovered_if_fixed": 0.0
+  "bot_vs_bot_exploits": ["specific exploit vs equity-based caller"],
+  "sizing_by_ehs": {{
+    "ehs_0.90_plus": {{"action": "all-in", "ev_math": ""}},
+    "ehs_0.78_to_0.90": {{"action": "large bet", "sizing": "1.2x pot", "ev_math": ""}},
+    "ehs_0.65_to_0.78": {{"action": "medium bet", "sizing": "0.75x pot", "ev_math": ""}}
+  }}
 }}
 """
 
-    print(f"[pipeline] Stage 1: launching 3 parallel DeepSeek agents...", file=sys.stderr)
-    stage1_results = query_parallel([
-        {"prompt": theory_prompt,  "model": "deepseek-reasoner", "system": RESEARCH_SYSTEM,    "timeout": 240, "max_tokens": 8192, "no_cache": True},
-        {"prompt": pattern_prompt, "model": "deepseek-reasoner", "system": RESEARCH_SYSTEM,    "timeout": 240, "max_tokens": 8192, "no_cache": True},
-        {"prompt": sim_prompt,     "model": "deepseek-reasoner", "system": SIMULATION_SYSTEM,  "timeout": 240, "max_tokens": 8192, "no_cache": True},
-    ], max_workers=3)
+    # ── Stage 1B: Cross-version pattern + behavior trend analysis ─────
+    pattern_prompt = f"""
+Analyze ALL historical versions of a poker bot to find patterns, behaviors, and improvement trajectory.
 
-    theory_raw, pattern_raw, sim_raw = stage1_results
-    print(f"[pipeline] Stage 1 complete. Lengths: theory={len(theory_raw)}, pattern={len(pattern_raw)}, sim={len(sim_raw)}", file=sys.stderr)
+CROSS-VERSION MISTAKE DATA (v1 through v{version}):
+{cross_str}
+
+CURRENT VERSION (v{version}) STATS:
+{stats_str}
+
+DEEP ANALYSIS TASKS:
+1. IMPROVEMENT TRAJECTORY: For each metric (fold_rate, bad_folds, call_rate, raise_rate),
+   compute the improvement % from v1 to v{version}. Is the improvement accelerating or plateauing?
+
+2. RECURRING FAILURES: Which exact mistake categories persist across ALL versions?
+   These are systematic bugs in our strategy logic, not random variance.
+
+3. BEHAVIORS THAT IMPROVED: List every metric that got better and by how much.
+   These represent validated fixes that must NOT be reversed.
+
+4. DIMINISHING RETURNS CHECK: Are the threshold changes (each -0.08 per cycle) hitting a floor?
+   If fold_rate was 77%→83%→46%→?, what is the predicted floor and are we near it?
+
+5. NEXT PRIORITY: Given the trajectory, what is the single highest-leverage fix for v{version+1}?
+
+Return JSON:
+{{
+  "improvement_trajectory": {{
+    "fold_rate": {{"v1": 0.0, "current": 0.0, "improvement_pct": 0.0, "trend": "accelerating/plateauing"}},
+    "bad_folds": {{"v1": 0, "current": 0, "improvement_pct": 0.0}},
+    "call_rate": {{"v1": 0.0, "current": 0.0, "improvement_pct": 0.0}},
+    "raise_rate": {{"v1": 0.0, "current": 0.0, "improvement_pct": 0.0}}
+  }},
+  "recurring_failures": [
+    {{"pattern": "", "versions_affected": [], "root_cause_field": "section.key", "ev_cost_per_100_hands": 0.0, "fix": ""}}
+  ],
+  "validated_improvements": ["what worked and must not regress"],
+  "floor_analysis": {{"current_fold_rate": 0.0, "predicted_floor": 0.0, "near_floor": true}},
+  "highest_leverage_fix": {{"field": "section.key", "old": 0.0, "new": 0.0, "expected_hands_saved": 0}},
+  "priority_order": ["field1 — highest EV fix", "field2", "field3"]
+}}
+"""
+
+    # ── Stage 1C: EV simulator (batched — 5 hands max to avoid truncation) ──
+    folds_batch = bad_fold_samples[:5]   # hard limit to prevent truncation
+    folds_batch_str = json.dumps(folds_batch, indent=2)
+    sim_prompt = f"""
+EV simulation engine. Replay each bad fold with alternative action. Show ALL math explicitly.
+
+BAD FOLDS (max 5 hands — we folded with EHS > 0.58):
+{folds_batch_str}
+
+CURRENT RULES (relevant thresholds):
+- preflop call_ip: {rules.get('preflop',{}).get('vs_raise_call_ip_min_ehs', '?')}
+- preflop call_oop: {rules.get('preflop',{}).get('vs_raise_call_oop_min_ehs', '?')}
+- flop call_min: {rules.get('flop',{}).get('facing_bet_call_min_ehs', '?')}
+- flop fold_max: {rules.get('flop',{}).get('facing_bet_fold_max_ehs', '?')}
+- pot_odds call_margin: {rules.get('pot_odds',{}).get('call_margin', 1.05)}
+
+FOR EACH HAND compute:
+  pot = estimated 10BB (use 10 if unknown)
+  call_size = estimated 5BB (use 5 if unknown)
+  EV_fold = 0 (definition)
+  EV_call = EHS * pot - (1-EHS) * call_size
+  EV_delta = EV_call - EV_fold
+  required_equity = call_size / (call_size + pot)
+  pot_odds_call = EHS >= required_equity * 1.05
+
+ALSO simulate river scenarios (no bad fold data needed):
+  Scenario 1: EHS=0.92, pot=100, opponent checks to us. EV of all-in vs check.
+    EV_allin = 0.40 * (0.92*(200) - 0.08*100) + 0.60 * 100  [assume 40% villain call freq]
+    EV_check = EHS * pot = 0.92 * 100  [approximate]
+  Scenario 2: EHS=0.78, pot=100. EV of 1.2x pot bet vs check.
+  Scenario 3: EHS=0.65, pot=100. EV of 0.75x pot bet vs check.
+
+Return compact JSON (IMPORTANT: keep response under 2000 tokens):
+{{
+  "fold_simulations": [
+    {{"hand": 0, "ehs": 0.0, "ev_fold": 0, "ev_call": 0.0, "ev_delta": 0.0,
+      "pot_odds_justified": true, "rule_violated": "section.key", "fix": 0.0}}
+  ],
+  "river_scenarios": [
+    {{"ehs": 0.92, "ev_allin": 0.0, "ev_check": 0.0, "allin_better": true}},
+    {{"ehs": 0.78, "ev_large_bet": 0.0, "ev_check": 0.0, "bet_better": true}},
+    {{"ehs": 0.65, "ev_med_bet": 0.0, "ev_check": 0.0, "bet_better": true}}
+  ],
+  "total_ev_recovered_if_fixed": 0.0,
+  "recommended_threshold_changes": [
+    {{"field": "section.key", "old": 0.0, "new": 0.0, "math": "concise"}}
+  ]
+}}
+"""
+
+    # ── Stage 1D: Opponent profiler ───────────────────────────────────
+    opp_prompt = f"""
+Profile the opponents our poker bot faces and prescribe counter-strategies.
+
+OBSERVED INTERACTION PATTERNS (inferred from our decision log):
+{opp_str}
+
+KNOWN OPPONENT TYPE: devfun arena pokerbench bots (bot_1 through bot_5)
+These bots:
+- Use pokerbench framework (public benchmark for poker AI evaluation)
+- Make decisions based on equity calculations (shown in chat: "equity X% covers price Y%")
+- Call when their EHS covers pot odds (pot-odds callers)
+- Value bet when they have the best hand and want worse hands to call
+- Rarely bluff (bots don't tilt or adapt emotionally)
+- Are consistent — they play the same strategy every session
+
+OUR CURRENT RULES:
+{rules_str}
+
+COUNTER-STRATEGY ANALYSIS:
+1. EXPLOIT POT-ODDS CALLERS:
+   If bot calls with EHS >= required_equity (pure pot odds), then:
+   - We should OVERBET with strong hands to charge them maximum equity
+   - We should bet LESS with medium hands to keep weaker calls in
+   - What exact bet sizes (as % of pot) maximize EV vs this calling strategy?
+
+2. EXPLOIT CONSISTENT BOTS:
+   Bots don't adjust to our strategy changes. If we always 3-bet with EHS >= 0.67,
+   they can't counter-adapt. What is the exploit window?
+
+3. PREFLOP STEAL FREQUENCY:
+   We are multi-way {opp_patterns.get('multiway_pct','?')}% of the time.
+   In multi-way pots, what EHS threshold should we use vs the pot-odds calling range of 5 bots?
+
+4. OPPONENT FOLD FREQUENCY ESTIMATE:
+   From our raises: avg_ehs_when_raised={opp_patterns.get('avg_ehs_when_raised','?')}
+   Assuming bots fold hands below their pot-odds threshold, estimate:
+   - Their fold-to-raise frequency
+   - Whether bluffing becomes +EV (only if fold_freq > 40%)
+
+Return JSON:
+{{
+  "opponent_profile": {{
+    "type": "pot_odds_caller",
+    "call_threshold_ehs": 0.0,
+    "bluff_frequency": 0.0,
+    "estimated_fold_to_raise_pct": 0.0
+  }},
+  "counter_strategies": [
+    {{"vs": "pot_odds_callers", "exploit": "description", "bet_sizing": "X% pot", "ev_math": ""}}
+  ],
+  "optimal_bet_sizes_vs_these_bots": {{
+    "strong_hand_ehs_0.80_plus": {{"sizing": "X% pot", "reason": "charges max equity to callers"}},
+    "medium_hand_ehs_0.65_to_0.80": {{"sizing": "X% pot", "reason": ""}},
+    "bluff_viable": false,
+    "bluff_threshold": "fold_freq must exceed 40% — current estimate X%"
+  }},
+  "preflop_adjustments": {{
+    "multiway_open_ehs": 0.0,
+    "headsup_open_ehs": 0.0,
+    "steal_frequency_recommendation": ""
+  }},
+  "rule_changes_from_opponent_analysis": [
+    {{"field": "section.key", "old": 0.0, "new": 0.0, "reason": "counter-strategy vs pot-odds bot"}}
+  ]
+}}
+"""
+
+    print(f"[pipeline] Stage 1: launching 4 parallel DeepSeek agents (A=theory, B=patterns, C=simulation, D=opponent)...", file=sys.stderr)
+    stage1_results = query_parallel([
+        {"prompt": theory_prompt, "model": "deepseek-reasoner", "system": RESEARCH_SYSTEM,   "timeout": 300, "max_tokens": 8192, "no_cache": True},
+        {"prompt": pattern_prompt,"model": "deepseek-reasoner", "system": RESEARCH_SYSTEM,   "timeout": 300, "max_tokens": 8192, "no_cache": True},
+        {"prompt": sim_prompt,    "model": "deepseek-reasoner", "system": SIMULATION_SYSTEM, "timeout": 240, "max_tokens": 4096, "no_cache": True},
+        {"prompt": opp_prompt,    "model": "deepseek-reasoner", "system": OPPONENT_SYSTEM,   "timeout": 240, "max_tokens": 4096, "no_cache": True},
+    ], max_workers=4)
+
+    theory_raw, pattern_raw, sim_raw, opp_raw = stage1_results
+    print(f"[pipeline] Stage 1 done. Lengths: A={len(theory_raw)} B={len(pattern_raw)} C={len(sim_raw)} D={len(opp_raw)}", file=sys.stderr)
 
     def _parse_json(raw: str, label: str) -> dict:
         clean = raw.strip()
@@ -430,54 +554,59 @@ Return JSON:
         try:
             return json.loads(clean)
         except Exception as e:
-            print(f"[pipeline] {label} JSON parse failed: {e}", file=sys.stderr)
-            return {"raw": raw[:500]}
+            print(f"[pipeline] {label} parse failed ({e}) — using raw excerpt", file=sys.stderr)
+            return {"_parse_error": str(e), "raw_excerpt": raw[:800]}
 
-    theory_data  = _parse_json(theory_raw,  "theory")
-    pattern_data = _parse_json(pattern_raw, "pattern")
-    sim_data     = _parse_json(sim_raw,     "simulation")
+    theory_data  = _parse_json(theory_raw,  "A-theory")
+    pattern_data = _parse_json(pattern_raw, "B-pattern")
+    sim_data     = _parse_json(sim_raw,     "C-simulation")
+    opp_data     = _parse_json(opp_raw,     "D-opponent")
 
-    # ── Stage 2: Orchestrator synthesizes all three agents ────────────
+    # ── Stage 2: Orchestrator synthesizes all 4 agents ────────────────
     orch_prompt = f"""
-You are the strategy orchestrator. Synthesize these three expert analyses into ONE implementation plan.
+You are the strategy orchestrator. Synthesize 4 expert analyses into ONE precise implementation plan.
 
-═══ AGENT A: POKER THEORY RESEARCH ═══
-{json.dumps(theory_data, indent=2)}
+═══ AGENT A: POKER THEORY + STRONG/WEAK AUDIT ═══
+{json.dumps(theory_data, indent=2)[:2000]}
 
-═══ AGENT B: CROSS-VERSION PATTERN ANALYSIS ═══
-{json.dumps(pattern_data, indent=2)}
+═══ AGENT B: CROSS-VERSION PATTERNS + TRAJECTORY ═══
+{json.dumps(pattern_data, indent=2)[:2000]}
 
-═══ AGENT C: EV SIMULATION RESULTS ═══
-{json.dumps(sim_data, indent=2)}
+═══ AGENT C: EV SIMULATION (hand-by-hand replay) ═══
+{json.dumps(sim_data, indent=2)[:1500]}
+
+═══ AGENT D: OPPONENT PROFILE + COUNTER-STRATEGIES ═══
+{json.dumps(opp_data, indent=2)[:1500]}
 
 ═══ CURRENT RULES (v{version}) ═══
 {rules_str}
 
-═══ CURRENT STATS ═══
+═══ PERFORMANCE STATS ═══
 {stats_str}
 
-SYNTHESIS TASK:
-1. A rule change is CONFIRMED if it is supported by at least 2 of the 3 agents.
-2. A rule change is SUGGESTED if supported by only 1 agent — include it but mark hallucination_risk=medium.
-3. A rule change is REJECTED if no agent supports it, or if ev_math contradicts it.
-4. For each confirmed change, write the exact field, old value, new value, and the combined evidence chain.
-5. Max delta per field: 0.08 per cycle. Enforce this strictly.
-6. For the new aggression tiers (all-in threshold, large bet threshold, medium bet threshold):
-   use Agent A's sizing recommendations and Agent C's EV analysis to set exact values.
-7. Do NOT recommend bluff_enabled=true — we have no opponent fold rate data.
+SYNTHESIS RULES (enforce strictly):
+1. CONFIRMED change = supported by ≥2 of 4 agents. Apply with confidence=high.
+2. SINGLE-AGENT change = 1 agent only. Apply only if ev_math is airtight. Mark confidence=medium.
+3. REJECT any change where: field doesn't exist in rules, delta > 0.08, direction contradicts regret data.
+4. STRONG ASPECTS from Agent A must not regress — flag any change that would hurt a strong aspect.
+5. OPPONENT COUNTER-STRATEGY from Agent D overrides generic GTO when agents conflict.
+6. Max delta = 0.08 per field per cycle.
+7. bluff_enabled=true requires opponent fold_freq > 40% with evidence — Agent D must confirm.
 
-Return ONLY valid JSON:
+Return ONLY valid JSON (no markdown, no explanations outside JSON):
 {{
   "version": {version},
+  "strong_aspects_preserved": ["list what v{version} does well that v{version+1} must keep"],
   "mistake_analysis": [
     {{
       "field": "section.key",
       "old": 0.0,
       "new": 0.0,
-      "evidence": "combined from agents A+B+C",
-      "ev_math": "explicit math showing EV improvement",
-      "supporting_agents": ["A", "B", "C"],
-      "confidence": "high/medium/low"
+      "evidence": "cite specific agents and their data",
+      "ev_math": "explicit calculation showing EV improvement",
+      "supporting_agents": ["A","B","C","D"],
+      "confidence": "high/medium/low",
+      "fixes": "which specific problem this solves"
     }}
   ],
   "aggression_tiers": {{
@@ -487,24 +616,26 @@ Return ONLY valid JSON:
     "medium_bet_min_ehs": 0.0,
     "medium_bet_pot_mult": 0.0,
     "flop_raise_aggressive_min_ehs": 0.0,
-    "ev_math": "from simulation showing these thresholds are +EV"
+    "ev_math": "from Agent C simulation"
   }},
-  "rules_must_not_change": ["field — reason with evidence from at least 2 agents"],
-  "bluff_justification": "no opponent fold rate data available — bluff_enabled stays false",
-  "claude_implementation_prompt": "FULL exact prompt for Claude to implement all changes",
+  "opponent_exploits_to_implement": [
+    {{"description": "exploit name", "code_change": "what to add/change", "ev_gain": ""}}
+  ],
+  "rules_must_not_change": ["field — reason backed by ≥2 agents"],
+  "bluff_verdict": "fold_freq estimate from Agent D, conclusion on bluff_enabled",
   "predicted_bb100_improvement": "+X to +Y",
   "convergence": false,
-  "hallucination_risk": "low/medium/high",
-  "rejected_changes": [{{"field": "x", "reason": "why rejected"}}]
+  "hallucination_risk": "low/medium/high — explain any weak-evidence changes",
+  "rejected_changes": [{{"field": "", "reason": ""}}]
 }}
 """
 
-    print(f"[pipeline] Stage 2: orchestrator synthesizing...", file=sys.stderr)
+    print(f"[pipeline] Stage 2: orchestrator synthesizing all 4 agents...", file=sys.stderr)
     orch_raw = query(
         prompt=orch_prompt,
         model="deepseek-reasoner",
         no_cache=True,
-        timeout=300,
+        timeout=360,
         system=ORCHESTRATOR_SYSTEM,
         max_tokens=8192,
     )
@@ -514,7 +645,9 @@ Return ONLY valid JSON:
         "theory":     theory_data,
         "patterns":   pattern_data,
         "simulation": sim_data,
+        "opponent":   opp_data,
     }
+    result["_opponent_patterns"] = opp_patterns
     return result
 
 

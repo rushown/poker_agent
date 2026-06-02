@@ -1,0 +1,52 @@
+{
+  "versions": {
+    "1": {
+      "version": 1,
+      "total_decisions": 564,
+      "fold_pct": 77.7,
+      "raise_pct": 14.0,
+      "call_pct": 0.7,
+      "bad_folds": 36,
+      "missed_value": 4,
+      "bad_raises": 1,
+      "score": -53.6,
+      "avg_ehs_fold": 0.452
+    },
+    "2": {
+      "version": 2,
+      "total_decisions": 552,
+      "fold_pct": 83.0,
+      "raise_pct": 10.9,
+      "call_pct": 0.7,
+      "bad_folds": 41,
+      "missed_value": 2,
+      "bad_raises": 0,
+      "score": -75.91,
+      "avg_ehs_fold": 0.448
+    },
+    "3": {
+      "version": 3,
+      "total_decisions": 753,
+      "fold_pct": 45.3,
+      "raise_pct": 29.1,
+      "call_pct": 3.5,
+      "bad_folds": 6,
+      "missed_value": 8,
+      "bad_raises": 1,
+      "score": 118.51,
+      "avg_ehs_fold": 0.424
+    },
+    "4": {
+      "version": 4,
+      "total_decisions": 308,
+      "fold_pct": 42.2,
+      "raise_pct": 31.5,
+      "call_pct": 2.9,
+      "bad_folds": 0,
+      "missed_value": 0,
+      "bad_raises": 1,
+      "score": 161.75,
+      "avg_ehs_fold": 0.407
+    }
+  }
+}
