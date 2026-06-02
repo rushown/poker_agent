@@ -28,7 +28,10 @@ ROOT   = Path(__file__).parent
 RULES  = ROOT / "strategy_rules.json"
 AGENTS = Path("/home/ocean/vscode/plutus-agents")
 PYTHON = ROOT / ".venv/bin/python"
-DS_KEY = os.getenv("DEEPSEEK_API_KEY", "sk-cc8b43eaf0124f889b482f29cd27d1a7")
+DS_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+if not DS_KEY:
+    print("ERROR: DEEPSEEK_API_KEY env var not set. Export it before running.", file=sys.stderr)
+    sys.exit(1)
 os.environ["DEEPSEEK_API_KEY"] = DS_KEY
 
 sys.path.insert(0, str(ROOT))

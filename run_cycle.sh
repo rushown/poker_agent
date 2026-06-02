@@ -17,7 +17,12 @@ set -e
 BASE=/home/ocean/vscode/poker_agent
 PYTHON=$BASE/.venv/bin/python
 AGENT_DIR=$BASE/.adaptive_agent
-DEEPSEEK_API_KEY=sk-cc8b43eaf0124f889b482f29cd27d1a7
+# Set DEEPSEEK_API_KEY in your environment before running:
+#   export DEEPSEEK_API_KEY=your_key_here
+if [ -z "$DEEPSEEK_API_KEY" ]; then
+  echo "ERROR: DEEPSEEK_API_KEY env var not set. Export it before running."
+  exit 1
+fi
 
 MAX_CYCLES=99
 HANDS_PER_CYCLE=150
