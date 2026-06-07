@@ -41,7 +41,7 @@ from agent.self_test_runner import run_startup_self_tests
 from api.action_amount import build_action_payload
 from models.opponent_tracker import OpponentTracker
 
-STRATEGY_VERSION = "v4-brutal"
+STRATEGY_VERSION = "v3-universal"
 
 
 def safe_fallback(allowed_actions) -> tuple[str, float]:
@@ -69,7 +69,8 @@ class PokerRunner:
         self.competition_id = competition_id or settings.arena_competition_id
         self.dry_run = dry_run
         self.max_hands = max_hands
-        self.hands_played = 0
+        self.hands_played = 0       # action submissions (not used for stop condition)
+        self.match_hands_played = 0 # arena completedHands (used for stop condition)
         self._running = True
         self.payouts: Optional[List[float]] = None
         self.competition_meta: Dict[str, Any] = {}
@@ -79,20 +80,25 @@ class PokerRunner:
         self._heartbeat_state = HeartbeatState(settings.heartbeat_state_file)
         self._last_heartbeat_loop = time.time()
         self._last_poll = 0.0
+        self._last_match_refresh = 0.0
         self._active_tables: set = set()
         self._shutting_down = False
         self._pending_actions = 0
         self._table_locks: Dict[str, Lock] = {}
         self._action_tx_log: List[Dict[str, Any]] = []
         self._started_at = time.time()
+        self._expired_tables: Dict[str, float] = {}
         self._bootstrap_table: Optional[Dict[str, Any]] = None
         self._match_phase: str = ""
+        self._bankroll_chips: int = -1
+        self._total_chips: int = -1
+        self._last_rebuy_attempt: float = 0.0
 
         self.tracker = OpponentTracker(settings.state_file)
         self.adaptive = AdaptiveMemory(settings.adaptive_state_file)
         self.brutal = BrutalSelfCheck()
         self.meta = MetaLearner()
-        _strat = os.getenv("ARENA_STRATEGY", "").strip().upper() or "S10"
+        _strat = os.getenv("ARENA_STRATEGY", "").strip().upper() or "ADAPTIVE"
         logger.info(f"Strategy: {_strat} | agent={settings.agent_name}")
         self.arbiter = StrategyArbiter(
             self.tracker, self.adaptive, self.meta, self.brutal
@@ -223,21 +229,31 @@ class PokerRunner:
         return True
 
     def setup(self) -> bool:
-        try:
-            cid, meta, client = onboard_and_join(
-                competition_id=self.competition_id,
-                dry_run=self.dry_run,
-                force_heartbeat=True,
-            )
-            self.client = client
-            self.competition_id = cid or ""
-            self.competition_meta = meta or {}
-        except ArenaAPIError as e:
-            logger.error(f"Arena setup failed: {e}")
-            return False
-        except RuntimeError as e:
-            logger.error(str(e))
-            return False
+        import httpx as _httpx
+        for _attempt in range(5):
+            try:
+                cid, meta, client = onboard_and_join(
+                    competition_id=self.competition_id,
+                    dry_run=self.dry_run,
+                    force_heartbeat=True,
+                )
+                self.client = client
+                self.competition_id = cid or ""
+                self.competition_meta = meta or {}
+                break
+            except (_httpx.ReadTimeout, _httpx.ConnectTimeout):
+                _wait = 20 * (_attempt + 1)
+                logger.warning(f"Arena timeout (attempt {_attempt+1}/5), retry in {_wait}s")
+                time.sleep(_wait)
+                if _attempt == 4:
+                    logger.error("Arena setup failed after 5 retries (timeout)")
+                    return False
+            except ArenaAPIError as e:
+                logger.error(f"Arena setup failed: {e}")
+                return False
+            except RuntimeError as e:
+                logger.error(str(e))
+                return False
 
         from agent.owner_messages import write_owner_message
         write_owner_message(settings.owner_message_file, continuous_arena_notice())
@@ -302,8 +318,41 @@ class PokerRunner:
                 seats_alive or self.arbiter.players_remaining,
             )
             self.match_hands_played = hands
+            participant = st.get("participant") or {}
+            if participant:
+                self._bankroll_chips = int(participant.get("bankrollChips", -1))
+                self._total_chips = int(participant.get("totalChips", -1))
         except Exception:
             pass
+
+    def _maybe_rebuy(self) -> None:
+        if self.dry_run or not self.competition_id:
+            return
+        # Only rebuy when completely bust (totalChips == 0); bankrollChips alone
+        # can be 0 while chips remain on the table, triggering a premature 403.
+        if self._total_chips != 0:
+            return
+        cooldown = 60.0
+        if time.time() - self._last_rebuy_attempt < cooldown:
+            return
+        self._last_rebuy_attempt = time.time()
+        try:
+            result = self.client.rebuy(self.competition_id)
+            participant = result.get("participant") or {}
+            new_chips = participant.get("totalChips", "?")
+            rebuy_count = participant.get("rebuyCount", "?")
+            self._bankroll_chips = int(participant.get("bankrollChips", 0))
+            self._total_chips = int(participant.get("totalChips", 0))
+            logger.info(
+                f"Rebuy credited — totalChips={new_chips} rebuyCount={rebuy_count}"
+            )
+        except ArenaAPIError as e:
+            if e.status == 402:
+                logger.warning("Rebuy requires on-chain payment — skipping")
+            elif e.status == 400:
+                logger.warning(f"Rebuy not available: {e.body}")
+            else:
+                logger.warning(f"Rebuy failed {e.status}: {e.body}")
 
     def _load_payouts(self) -> None:
         if not self.competition_id:
@@ -346,12 +395,14 @@ class PokerRunner:
         _503_streak = 0
         self._maybe_heartbeat(force=False)
         while self._running:
-            if self.max_hands and self.hands_played >= self.max_hands:
+            if self.max_hands and self.match_hands_played >= self.max_hands:
                 break
             if time.time() - self._last_heartbeat_loop >= settings.heartbeat_interval_s:
                 self._maybe_heartbeat()
                 self._last_heartbeat_loop = time.time()
-            self._refresh_match_context()
+            if time.time() - self._last_match_refresh >= 30.0:
+                self._refresh_match_context()
+                self._last_match_refresh = time.time()
             self._watchdog_check()
             self._rate_limit_poll()
             if self._consume_bootstrap_table(prev_states):
@@ -375,6 +426,7 @@ class PokerRunner:
                 continue
             if not tables:
                 self.brutal.record_action()
+                self._maybe_rebuy()
                 time.sleep(settings.poll_interval_s)
                 continue
             tables = sorted(
@@ -390,12 +442,14 @@ class PokerRunner:
         _503_streak = 0
         self._maybe_heartbeat(force=False)
         while self._running:
-            if self.max_hands and self.hands_played >= self.max_hands:
+            if self.max_hands and self.match_hands_played >= self.max_hands:
                 break
             if time.time() - self._last_heartbeat_loop >= settings.heartbeat_interval_s:
                 self._maybe_heartbeat()
                 self._last_heartbeat_loop = time.time()
-            self._refresh_match_context()
+            if time.time() - self._last_match_refresh >= 30.0:
+                self._refresh_match_context()
+                self._last_match_refresh = time.time()
             self._watchdog_check()
             await self._async_rate_limit_poll()
             if await self._async_consume_bootstrap_table(prev_states):
@@ -420,6 +474,7 @@ class PokerRunner:
 
             if not tables:
                 self.brutal.record_action()
+                self._maybe_rebuy()
                 await asyncio.sleep(settings.poll_interval_s)
                 continue
 
@@ -440,7 +495,7 @@ class PokerRunner:
         prev_hand = self._prev_hand.get(table_id) or prev.get("handNumber") or prev.get("handId")
         curr_hand = table.get("handNumber") or table.get("handId")
 
-        if prev_hand and curr_hand and prev_hand != curr_hand:
+        if prev_hand is not None and curr_hand is not None and prev_hand != curr_hand:
             _, actions = self._hand_buffer.pop_completed(table_id, prev_hand)
             seats = prev.get("seats") or prev.get("players", [])
             winners = table.get("winners") or prev.get("winners")
@@ -475,12 +530,16 @@ class PokerRunner:
 
     def _handle_table_sync(self, table: dict, prev_states: dict) -> None:
         table_id = extract_table_id(table)
+        if self._expired_tables.get(table_id, 0) > time.time():
+            return
         with self._table_lock(table_id):
             self._buffer_and_finalize(table, table_id, prev_states)
             self._decide_and_submit(table, table_id)
 
     async def _handle_table_async(self, table: dict, prev_states: dict) -> None:
         table_id = extract_table_id(table)
+        if self._expired_tables.get(table_id, 0) > time.time():
+            return
         async with self._table_lock(table_id):
             self._buffer_and_finalize(table, table_id, prev_states)
             deadline = (
@@ -494,12 +553,14 @@ class PokerRunner:
         budget = settings.decision_budget_s
         if deadline:
             budget = min(budget, max(0.2, deadline - time.time() - 0.2))
-            try:
-                await asyncio.wait_for(
-                    self._decide_and_submit_async(table, table_id, deadline),
-                    timeout=budget,
-                )
-            except asyncio.TimeoutError:
+        submitted: list[bool] = [False]
+        try:
+            await asyncio.wait_for(
+                self._decide_and_submit_async(table, table_id, deadline, submitted),
+                timeout=budget,
+            )
+        except asyncio.TimeoutError:
+            if not submitted[0]:
                 allowed = table.get("allowedActions") or []
                 action, amount = safe_fallback(allowed)
                 await self._submit_async(
@@ -533,7 +594,8 @@ class PokerRunner:
                 action, amount, chat = self.arbiter.decide(ctx, deadline=deadline or 0)
             except Exception as e:
                 logger.exception(f"Arbiter error: {e}")
-                action, amount, chat = safe_fallback(allowed)[0], 0, "Error fallback"
+                action, amount = safe_fallback(allowed)
+                chat = "Error fallback"
 
             self._decision_times.append((time.monotonic() - t0) * 1000)
             if len(self._decision_times) > 500:
@@ -542,7 +604,7 @@ class PokerRunner:
             action, amount = self._validate_action(
                 action, amount, ctx.allowed_actions, ctx.stack
             )
-            self.play_stats.record_decision(
+            self.play_stats.log_decision(
                 table_id=table_id,
                 hand_number=ctx.hand_number,
                 position=ctx.position,
@@ -569,7 +631,7 @@ class PokerRunner:
             self._active_tables.discard(table_id)
 
     async def _decide_and_submit_async(
-        self, table: dict, table_id: str, deadline: float
+        self, table: dict, table_id: str, deadline: float, submitted: list[bool] | None = None
     ) -> None:
         if self._shutting_down:
             return
@@ -580,6 +642,8 @@ class PokerRunner:
             ctx = parse_table(table, self.client.agent_id, payouts=self.payouts)
             if ctx is None:
                 action, amount = safe_fallback(allowed)
+                if submitted is not None:
+                    submitted[0] = True
                 await self._submit_async(table_id, action, amount, table, "Parse fallback")
                 return
 
@@ -588,6 +652,8 @@ class PokerRunner:
 
             if deadline and (deadline - time.time()) < 0.25:
                 action, amount = safe_fallback(allowed)
+                if submitted is not None:
+                    submitted[0] = True
                 await self._submit_async(table_id, action, amount, table, "Clock emergency")
                 return
 
@@ -601,7 +667,8 @@ class PokerRunner:
                 action, amount, chat = await loop.run_in_executor(None, _decide)
             except Exception as e:
                 logger.exception(f"Arbiter error: {e}")
-                action, amount, chat = safe_fallback(allowed)[0], 0, "Error fallback"
+                action, amount = safe_fallback(allowed)
+                chat = "Error fallback"
 
             self._decision_times.append((time.monotonic() - t0) * 1000)
             if len(self._decision_times) > 500:
@@ -610,7 +677,7 @@ class PokerRunner:
             action, amount = self._validate_action(
                 action, amount, ctx.allowed_actions, ctx.stack
             )
-            self.play_stats.record_decision(
+            self.play_stats.log_decision(
                 table_id=table_id,
                 hand_number=ctx.hand_number,
                 position=ctx.position,
@@ -631,6 +698,8 @@ class PokerRunner:
                 decision_time_ms=(time.monotonic() - t0) * 1000,
                 opponent_ids=ctx.opponent_ids,
             )
+            if submitted is not None:
+                submitted[0] = True
             await self._submit_async(table_id, action, amount, table, chat)
         finally:
             self._pending_actions = max(0, self._pending_actions - 1)
@@ -687,14 +756,21 @@ class PokerRunner:
             if e.status == 400:
                 self._submit_safe_fallback(table_id, table, chat, original_error=e)
             elif e.status == 409:
-                logger.warning(f"Table {table_id} no longer active (409), skipping action")
+                self._expired_tables[table_id] = time.time() + 30.0
+                logger.warning(f"Table {table_id} no longer active (409), suppressing for 30s")
+            elif e.status == 504:
+                logger.warning(f"Table {table_id} action timed out, skipping")
             else:
                 logger.error(f"Submit failed {e.status}: {e.body}")
+        except Exception as e:
+            logger.warning(f"Table {table_id} submit error ({type(e).__name__}), skipping")
 
     def _post_action_payload(
         self, payload: Dict[str, Any], table_id: str, table: dict
     ) -> None:
-        self.client.submit_action_payload_safe(payload)
+        result = self.client.submit_action_payload_safe(payload)
+        if result is None:
+            raise ArenaAPIError(409, "table no longer active")
         self.brutal.record_api_call(True, 200)
         self.brutal.record_action()
         act = str(payload.get("action", "fold")).upper()
@@ -779,9 +855,14 @@ class PokerRunner:
                     ),
                 )
             elif e.status == 409:
-                logger.warning(f"Table {table_id} no longer active (409), skipping action")
+                self._expired_tables[table_id] = time.time() + 30.0
+                logger.warning(f"Table {table_id} no longer active (409), suppressing for 30s")
+            elif e.status == 504:
+                logger.warning(f"Table {table_id} action timed out, skipping")
             else:
                 logger.error(f"Submit failed {e.status}: {e.body}")
+        except Exception as e:
+            logger.warning(f"Table {table_id} submit error ({type(e).__name__}), skipping")
 
 
 def main():

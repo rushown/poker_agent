@@ -201,6 +201,20 @@ def join_competition(
             if "benchmark" in err_text:
                 logger.info("Routing to /texas/benchmark/start (eval competition)")
                 return start_benchmark_match(client, competition_id)
+            if "lobby" in err_text or "matchmaking" in err_text or "already" in err_text:
+                logger.info("Already in matchmaking lobby — polling for queue position")
+                return {"kind": "waiting_in_lobby", "lobby": client.get_lobby(competition_id)}
+            if "chip" in err_text or "buy" in err_text or "enough" in err_text:
+                # Not enough free chips — current table chips not yet returned
+                # Wait for chips to come back, then retry
+                import time
+                logger.warning(f"Not enough chips to buy in ({e.body}) — waiting 30s for table to finish")
+                time.sleep(30)
+                try:
+                    return client.join_table(competition_id)
+                except Exception:
+                    logger.info("Still no chips available — will retry next poll cycle")
+                    return {"kind": "waiting_for_chips", "lobby": {}}
         if e.status == 403:
             claim = client.get_claim_status()
             logger.error(

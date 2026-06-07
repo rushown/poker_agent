@@ -10,11 +10,20 @@ Decision flow (every hand):
 from __future__ import annotations
 
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from agent.chat_tilt import build_chat_message, mistake_line
+_tl = threading.local()
+_tl.opponent_type = "unknown"
+_tl.opponent_stats = None   # OpponentStats for dominant opponent (used by midgame)
+
+def build_chat_message(action: str, **kw) -> str:
+    return action.upper()
+
+def mistake_line() -> str:
+    return ""
 from agent.meta_learner import MetaLearner, NUMBERED_STRATEGIES
 from engine.ehs import calculate_ehs, clear_ehs_cache, samples_for_street
 from engine.hand_eval import hand_notation
@@ -118,6 +127,20 @@ class StrategyArbiter:
         # 3. Emergency time fallback
         if self._over_budget(start, budget):
             return self._finalize(ctx, *self._fast_fallback(ctx, ehs))
+
+        # 4. Classify dominant opponent — inject via thread-local (safe for async multi-table)
+        if ctx.opponent_ids:
+            dominant_type = "unknown"
+            dominant_stats = None
+            for oid in ctx.opponent_ids:
+                stats = self.tracker.get(oid)
+                if stats and stats.hands_seen >= 8:
+                    profile = self.detector.classify(stats)
+                    dominant_type = profile.bot_type.value
+                    dominant_stats = stats
+                    break
+            _tl.opponent_type = dominant_type
+            _tl.opponent_stats = dominant_stats   # used by midgame bluff detection
 
         # 4. ADAPTIVE strategy decision
         sid = self._strategy_override

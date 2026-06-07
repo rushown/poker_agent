@@ -170,7 +170,7 @@ def query(
 
 # ── Parallel multi-agent queries ──────────────────────────────────────
 
-def query_parallel(tasks: list[dict], max_workers: int = 4) -> list[str]:
+def query_parallel(tasks: list[dict], max_workers: int = 8) -> list[str]:
     """Run multiple DeepSeek queries in parallel.
 
     Each task dict: {prompt, model, system, timeout, max_tokens, no_cache}
@@ -291,7 +291,9 @@ def multi_agent_pipeline(
     log_path_str: str = "",
     all_log_files: list[str] | None = None,
 ) -> dict:
-    """Full 4-agent DeepSeek research pipeline for reinforcement cycle.
+    """LEGACY — built for the old 500-hand benchmark format. Use query_parallel directly for new analyses.
+
+    Full 4-agent DeepSeek research pipeline for reinforcement cycle.
 
     Stage 1 (4 parallel agents):
       A — Poker theory researcher: GTO thresholds, optimal sizing
@@ -554,8 +556,9 @@ Return JSON:
         try:
             return json.loads(clean)
         except Exception as e:
-            print(f"[pipeline] {label} parse failed ({e}) — using raw excerpt", file=sys.stderr)
-            return {"_parse_error": str(e), "raw_excerpt": raw[:800]}
+            print(f"[pipeline] {label} parse failed ({e}) — agent output not valid JSON, skipping", file=sys.stderr)
+            # Return empty dict rather than raw excerpt — prevents orchestrator hallucinating from partial text
+            return {"_parse_error": str(e), "_label": label}
 
     theory_data  = _parse_json(theory_raw,  "A-theory")
     pattern_data = _parse_json(pattern_raw, "B-pattern")
@@ -563,20 +566,35 @@ Return JSON:
     opp_data     = _parse_json(opp_raw,     "D-opponent")
 
     # ── Stage 2: Orchestrator synthesizes all 4 agents ────────────────
+    def _safe_truncate(d: dict, max_chars: int) -> str:
+        """Serialise dict; if over limit, drop large list fields until it fits."""
+        s = json.dumps(d, indent=2)
+        if len(s) <= max_chars:
+            return s
+        # Drop the biggest list value until within budget
+        trimmed = dict(d)
+        for key in sorted(trimmed, key=lambda k: len(json.dumps(trimmed[k])), reverse=True):
+            if isinstance(trimmed[key], list) and len(trimmed[key]) > 3:
+                trimmed[key] = trimmed[key][:3] + [{"_truncated": True}]
+                s = json.dumps(trimmed, indent=2)
+                if len(s) <= max_chars:
+                    break
+        return s[:max_chars]  # hard cap only as last resort
+
     orch_prompt = f"""
 You are the strategy orchestrator. Synthesize 4 expert analyses into ONE precise implementation plan.
 
 ═══ AGENT A: POKER THEORY + STRONG/WEAK AUDIT ═══
-{json.dumps(theory_data, indent=2)[:2000]}
+{_safe_truncate(theory_data, 2500)}
 
 ═══ AGENT B: CROSS-VERSION PATTERNS + TRAJECTORY ═══
-{json.dumps(pattern_data, indent=2)[:2000]}
+{_safe_truncate(pattern_data, 2500)}
 
 ═══ AGENT C: EV SIMULATION (hand-by-hand replay) ═══
-{json.dumps(sim_data, indent=2)[:1500]}
+{_safe_truncate(sim_data, 2000)}
 
 ═══ AGENT D: OPPONENT PROFILE + COUNTER-STRATEGIES ═══
-{json.dumps(opp_data, indent=2)[:1500]}
+{_safe_truncate(opp_data, 2000)}
 
 ═══ CURRENT RULES (v{version}) ═══
 {rules_str}

@@ -11,10 +11,10 @@ FULL_DECK = [r + s for r in RANKS for s in SUITS]
 
 # Per-street sample counts (balance speed vs variance)
 STREET_SAMPLES = {
-    "preflop": 200,
-    "flop": 400,
-    "turn": 600,
-    "river": 600,
+    "preflop": 400,   # increased from 200 — reduce 3.5% variance to 2.5% at decision boundaries
+    "flop": 600,      # increased from 400
+    "turn": 800,      # increased from 600
+    "river": 800,     # increased from 600
 }
 
 # Tighter villain range when facing aggression (notation buckets by weight)

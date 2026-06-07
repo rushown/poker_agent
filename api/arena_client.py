@@ -66,9 +66,11 @@ class ArenaClient:
         self._api_key = api_key
         self._agent_id = agent_id
         self._introspection: Optional[Dict] = None
-        self._http = httpx.Client(timeout=timeout)
+        self._http = httpx.Client(
+            timeout=httpx.Timeout(timeout, connect=5.0, read=15.0, write=10.0)
+        )
         self._breaker = CircuitBreaker()
-        self._error_window = RollingErrorWindow(window_s=60.0, max_rate=0.15)
+        self._error_window = RollingErrorWindow(window_s=60.0, max_rate=0.40)
         self._session: Optional[aiohttp.ClientSession] = None
 
     def _headers(self) -> Dict[str, str]:
@@ -152,6 +154,15 @@ class ArenaClient:
                     continue
                 self._record_call(False, e.status)
                 raise
+            except httpx.TransportError as e:
+                wait = self._parse_retry_after(None, attempt)
+                logger.warning(f"GET {path} transport error ({type(e).__name__}), retry in {wait:.1f}s")
+                self._error_window.record(False)
+                if attempt < 3:
+                    time.sleep(wait + random.uniform(0.05, 0.25))
+                    last_err = ArenaAPIError(503, f"GET transport: {e!r}")
+                    continue
+                raise ArenaAPIError(503, f"GET transport failed: {e!r}") from e
             except Exception:
                 self._record_call(False)
                 raise
@@ -167,7 +178,8 @@ class ArenaClient:
                 raise ArenaAPIError(503, "circuit breaker open")
             try:
                 r = self._http.post(
-                    self._url(path), headers=self._headers(), json=body
+                    self._url(path), headers=self._headers(), json=body,
+                    timeout=httpx.Timeout(10.0, connect=5.0, read=6.0, write=6.0),
                 )
                 if r.status_code in (503, 429):
                     wait = self._parse_retry_after(r.headers, attempt)
@@ -185,6 +197,23 @@ class ArenaClient:
                     continue
                 self._record_call(False, e.status)
                 raise
+            except httpx.TimeoutException as e:
+                self._error_window.record(False)
+                logger.warning(f"POST {path} timeout (attempt {attempt+1}/4)")
+                if attempt < 3:
+                    time.sleep(self._parse_retry_after(None, attempt) + 0.5)
+                    last_err = ArenaAPIError(504, str(e))
+                    continue
+                raise ArenaAPIError(504, f"POST timeout: {e}") from e
+            except httpx.TransportError as e:
+                wait = self._parse_retry_after(None, attempt)
+                logger.warning(f"POST {path} transport error ({type(e).__name__}), retry in {wait:.1f}s")
+                self._error_window.record(False)
+                if attempt < 3:
+                    time.sleep(wait + 0.5)
+                    last_err = ArenaAPIError(503, f"POST transport: {e!r}")
+                    continue
+                raise ArenaAPIError(503, f"POST transport failed: {e!r}") from e
             except Exception:
                 self._record_call(False)
                 raise
@@ -282,13 +311,24 @@ class ArenaClient:
                     continue
                 self._record_call(False, e.status)
                 raise
+            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                wait = self._parse_retry_after(None, attempt)
+                logger.warning(
+                    f"async POST {path} transport error ({type(e).__name__}), "
+                    f"retry in {wait:.1f}s"
+                )
+                self._error_window.record(False)
+                if attempt < 3:
+                    await asyncio.sleep(wait + random.uniform(0.05, 0.25))
+                    continue
+                raise ArenaAPIError(503, f"async POST transport failed: {e!r}") from e
         if last_err:
             raise last_err
         raise ArenaAPIError(503, "async POST retries exhausted")
 
     def save_credentials(self) -> None:
         with open(self.credentials_file, "w") as f:
-            json.dump({"api_key": self._api_key, "agent_id": self._agent_id}, f)
+            json.dump({"apiKey": self._api_key, "agentId": self._agent_id}, f)
         os.chmod(self.credentials_file, 0o600)
 
     def load_credentials(self) -> bool:
@@ -557,6 +597,36 @@ class ArenaClient:
     def redeem_faucet(self, invite_code: str) -> Dict:
         return self._post("/agent/wallet/faucet", {"inviteCode": invite_code})
 
+    def rebuy(self, competition_id: str, tx_hash: str = "") -> Dict:
+        body: Dict = {"competitionId": competition_id}
+        if tx_hash:
+            body["txHash"] = tx_hash
+        return self._post("/texas/rebuy", body)
+
+    def get_lobby(self, competition_id: str) -> Dict:
+        return self._get("/texas/lobby", params={"competitionId": competition_id})
+
+    def get_agent_stats(self, competition_id: str, agent_id: str) -> Dict:
+        return self._get(
+            "/texas/agent-stats",
+            params={"competitionId": competition_id, "agentId": agent_id},
+        )
+
+    def get_recent_tables(
+        self, competition_id: str, limit: int = 20, offset: int = 0
+    ) -> Dict:
+        return self._get(
+            "/texas/recent-tables",
+            params={
+                "competitionId": competition_id,
+                "limit": limit,
+                "offset": offset,
+            },
+        )
+
+    def get_jackpots(self, competition_id: str) -> Dict:
+        return self._get("/texas/jackpots", params={"competitionId": competition_id})
+
     def _retry_sleep(self, attempt: int) -> None:
         base = min(2.0, 0.15 * (2**attempt))
         time.sleep(base + random.uniform(0, 0.25))
@@ -628,9 +698,11 @@ class ArenaClient:
             try:
                 return self.submit_action_payload(payload)
             except ArenaAPIError as e:
-                if e.status == 409 and attempt < retries:
-                    self._retry_sleep(attempt)
-                    continue
+                if e.status == 409:
+                    raise
+                if e.status == 504:
+                    logger.warning("submit_action_payload_safe: network timeout, skipping")
+                    return None
                 if e.status in (503, 429) and attempt < retries:
                     time.sleep(e.retry_after or 1.0)
                     continue

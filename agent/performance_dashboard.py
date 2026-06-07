@@ -1,108 +1,54 @@
-"""agent/performance_dashboard.py — per-mode EV / VPIP / PFR logging."""
+"""agent/performance_dashboard.py — lightweight performance tracking per strategy."""
 from __future__ import annotations
 
-import csv
-import json
-import os
-import time
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Dict, Optional
-
-
-@dataclass
-class ModeStats:
-    hands: int = 0
-    chip_delta: float = 0.0
-    vpip: int = 0
-    pfr: int = 0
-    wins: int = 0
+from collections import deque
+from typing import Deque, Dict
 
 
 class PerformanceDashboard:
-    def __init__(
-        self,
-        csv_path: str = "performance_history.csv",
-        json_path: str = "performance_dashboard.json",
-    ):
-        self.csv_path = Path(csv_path)
-        self.json_path = Path(json_path)
-        self.by_mode: Dict[str, ModeStats] = {}
-        self._ensure_csv()
+    def __init__(self, *a, **kw):
+        self._deltas: Deque[float] = deque(maxlen=500)
+        self._by_strategy: Dict[str, Deque[float]] = {}
+        self._wins = 0
+        self._hands = 0
 
-    def _ensure_csv(self) -> None:
-        if self.csv_path.exists():
-            return
-        with self.csv_path.open("w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(
-                [
-                    "timestamp",
-                    "strategy_mode",
-                    "meta_strategy",
-                    "hands",
-                    "bb100",
-                    "win_rate",
-                    "vpip",
-                    "pfr",
-                ]
-            )
+    def record(self, *a, **kw) -> None:
+        pass
 
     def record_hand(
         self,
-        *,
-        strategy_mode: str,
-        meta_strategy: str,
-        stack_delta: float,
-        bb_size: float,
-        vpip: bool,
-        pfr: bool,
-        won: Optional[bool],
+        strategy_mode: str = "",
+        meta_strategy: str = "",
+        stack_delta: float = 0.0,
+        bb_size: float = 2.0,
+        vpip: bool = False,
+        pfr: bool = False,
+        won: object = None,
     ) -> None:
-        for key in (strategy_mode, meta_strategy):
-            st = self.by_mode.setdefault(key, ModeStats())
-            st.hands += 1
-            st.chip_delta += stack_delta
-            if vpip:
-                st.vpip += 1
-            if pfr:
-                st.pfr += 1
-            if won:
-                st.wins += 1
-
-        bb100 = (stack_delta / max(1, bb_size)) * 100
-        wr = 1.0 if won else 0.0
-        with self.csv_path.open("a", newline="") as f:
-            csv.writer(f).writerow(
-                [
-                    time.time(),
-                    strategy_mode,
-                    meta_strategy,
-                    1,
-                    round(bb100, 2),
-                    wr,
-                    int(vpip),
-                    int(pfr),
-                ]
-            )
-        self._flush_json()
-
-    def _flush_json(self) -> None:
-        out = {}
-        for mode, st in self.by_mode.items():
-            h = max(1, st.hands)
-            out[mode] = {
-                "hands": st.hands,
-                "bb_per_hand": round(st.chip_delta / h, 3),
-                "vpip_pct": round(100 * st.vpip / h, 1),
-                "pfr_pct": round(100 * st.pfr / h, 1),
-                "win_rate": round(st.wins / h, 3),
-            }
-        tmp = str(self.json_path) + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(out, f, indent=2)
-        os.replace(tmp, self.json_path)
+        self._hands += 1
+        bb_delta = stack_delta / max(1.0, bb_size)
+        self._deltas.append(bb_delta)
+        key = meta_strategy or strategy_mode or "default"
+        if key not in self._by_strategy:
+            self._by_strategy[key] = deque(maxlen=200)
+        self._by_strategy[key].append(bb_delta)
+        if won is True:
+            self._wins += 1
 
     def snapshot(self) -> dict:
-        self._flush_json()
-        return json.loads(self.json_path.read_text()) if self.json_path.exists() else {}
+        recent = list(self._deltas)
+        avg = sum(recent) / len(recent) if recent else 0.0
+        by_strat = {
+            k: round(sum(v) / len(v), 3) if v else 0.0
+            for k, v in self._by_strategy.items()
+        }
+        return {
+            "hands": self._hands,
+            "wins": self._wins,
+            "win_rate": round(self._wins / max(1, self._hands), 3),
+            "avg_bb_per_hand": round(avg, 3),
+            "by_strategy": by_strat,
+        }
+
+    def summary(self, *a, **kw) -> dict:
+        return self.snapshot()

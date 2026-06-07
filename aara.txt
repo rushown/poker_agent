@@ -1,0 +1,14 @@
+Kill:
+  tmux kill-session -t devil
+  tmux kill-session -t optimal
+
+  Or one-liner:
+  tmux kill-session -t devil; tmux kill-session -t optimal
+
+---
+Start both:
+  tmux new-session -d -s devil -c /home/ocean/vscode/poker_agent && tmux send-keys -t devil "python3 run_devil.py" Enter
+  tmux new-session -d -s optimal -c /home/ocean/vscode/poker_agent && tmux send-keys -t optimal "python3 -m agent.runner" Enter
+
+  Or one-liner:
+  tmux new-session -d -s devil "python3 run_devil.py" && tmux new-session -d -s optimal "python3 -m agent.runner"
