@@ -32,8 +32,19 @@ git clone https://github.com/<your-username>/poker_agent.git
 cd poker_agent
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-nano .env  # paste API keys
+cp .env.example .env
+nano .env  # fill in all API keys and agent IDs (see .env.example for all fields)
 ```
+
+### Credentials needed in `.env`
+| Variable | Agent |
+|---|---|
+| `ARENA_API_KEY` + `ARENA_AGENT_ID` | Main Plutus |
+| `DEVIL_ARENA_API_KEY` + `DEVIL_ARENA_AGENT_ID` | Devil |
+| `AGGRO_ARENA_API_KEY` + `AGGRO_ARENA_AGENT_ID` | Plutus Aggro |
+| `DEEPSEEK_API_KEY` | Analysis scripts |
+
+No per-agent `.arena-credentials` files needed — all credentials live in root `.env`.
 
 ## Running Bots
 ```bash

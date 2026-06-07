@@ -5,7 +5,22 @@ from pathlib import Path
 # Must set ENV_FILE before any settings import
 os.environ["ENV_FILE"] = "plutus_aggro/.env"
 
-# Load credentials from gitignored .arena-credentials (env vars override if set)
+# Load root .env first so AGGRO_ARENA_* vars are available (no-op if already set)
+def _load_root_env():
+    p = Path(".env")
+    if not p.exists():
+        return
+    for line in p.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        k = k.strip()
+        if k and k not in os.environ:
+            os.environ[k] = v.strip()
+_load_root_env()
+
+# Load credentials: env vars (from root .env or shell) take priority over .arena-credentials
 _creds_path = Path("plutus_aggro/.arena-credentials")
 if _creds_path.exists():
     _c = json.loads(_creds_path.read_text())
