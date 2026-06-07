@@ -12,3 +12,4 @@ performance_dashboard.json
 ab_tests.json
 strategy_report.json
 *.tmp
+hostings.md
