@@ -64,7 +64,7 @@ else:
 _ENV = {
     "ARENA_API_KEY":         _api_key,
     "ARENA_AGENT_ID":        _agent_id,
-    "ARENA_COMPETITION_ID":  os.environ.get("BLUFF27_COMPETITION_ID", "cmpy2qy65002ud9ej6b7jjq0l"),
+    "ARENA_COMPETITION_ID":  os.environ.get("BLUFF27_COMPETITION_ID", "cmq57o53r0bhw18g23qkydb08"),
     "AGENT_NAME":            _NAME,
     "AGENT_QUOTE":           "I bluff with the worst hand. And I win.",
     "HEALTH_PORT":           _PORT,
