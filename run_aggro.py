@@ -36,7 +36,7 @@ else:
 _AGGRO_ENV = {
     "ARENA_API_KEY":         _aggro_api_key,
     "ARENA_AGENT_ID":        _aggro_agent_id,
-    "ARENA_COMPETITION_ID":  "cmpy2qy65002ud9ej6b7jjq0l",
+    "ARENA_COMPETITION_ID":  "cmq57o53r0bhw18g23qkydb08",
     "AGENT_NAME":            "Plutus_Aggro",
     "AGENT_QUOTE":           "I raise first, ask questions never.",
     "HEALTH_PORT":           "8081",

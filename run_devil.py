@@ -34,7 +34,7 @@ else:
 _DEVIL_ENV = {
     "ARENA_API_KEY":         _devil_api_key,
     "ARENA_AGENT_ID":        _devil_agent_id,
-    "ARENA_COMPETITION_ID":  "cmpy2qy65002ud9ej6b7jjq0l",
+    "ARENA_COMPETITION_ID":  "cmq57o53r0bhw18g23qkydb08",
     "AGENT_NAME":            "devil",
     "AGENT_QUOTE":           "Your chips belong to me.",
     "HEALTH_PORT":           "8082",
