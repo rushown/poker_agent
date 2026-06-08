@@ -1,0 +1,67 @@
+{
+  "version": "bluff27_v1",
+  "cycle": "bluff27_v1",
+  "core_principle": "Win with 7-2 offsuit: detect 7-2 \u2192 execute aggressive bluff sequence. Normal hands: play optimal EV-based strategy.",
+  "bluff_27_override": {
+    "enabled": true,
+    "detection": "hole cards contain exactly 7 and 2, different suits",
+    "preflop_raise_bb": 3.0,
+    "preflop_shove_if_facing_raise": true,
+    "preflop_shove_condition": "if facing a raise (not all-in) and call_amount <= 0.30 * stack; else if facing all-in, fold",
+    "flop_action": "all_in",
+    "turn_action_if_called_flop": "fold",
+    "fold_to_opponent_allin": true,
+    "made_pair_ehs_threshold": 0.52,
+    "ev_math": "open 3BB (48% fold = +0.72BB) then flop all-in (95% fold = +5.7BB) total fold prob = 97.4%, EV = +5.2BB per attempt",
+    "notes": "Do NOT bluff on 3+ streets \u2014 go all-in on flop for max fold equity. If board pairs our 7 or 2, defer to normal strategy."
+  },
+  "preflop": {
+    "open_ip": 0.36,
+    "open_oop": 0.28,
+    "raise_size_bb": 3.0,
+    "call_3bet_range": "standard optimal, adjust for bot fold tendency",
+    "4bet_range": "value-heavy, polarized"
+  },
+  "flop": {
+    "cbet_frequency": 0.8,
+    "cbet_size": 0.67,
+    "value_bet_threshold": 0.49,
+    "bluff_frequency": 0.0,
+    "check_fold_ratio": "when below value threshold"
+  },
+  "turn": {
+    "value_bet_threshold": 0.55,
+    "bluff_frequency": 0.0,
+    "bet_size": 0.75,
+    "continuation_frequency": "only with strong hands"
+  },
+  "river": {
+    "value_bet_threshold": 0.6,
+    "bluff_frequency": 0.0,
+    "bet_size": 0.85,
+    "fold_to_raise": "if equity below required pot odds"
+  },
+  "aggression": {
+    "all_in_threshold": 0.82,
+    "raise_for_value_only": true,
+    "re_raise_threshold": 0.75,
+    "aggression_factor": 1.0
+  },
+  "adjustments": {
+    "exploit_all_in_fold": "use all-in only when hand meets threshold (0.82) to exploit 95% fold rate",
+    "exploit_postflop_call": "value bet heavy, no bluffs because bots rarely fold",
+    "short_stack_adjustment": "when stack < 20BB, reduce all-in threshold to 0.62",
+    "note": "Do not over-conserve chips for 7-2 opportunities; optimal play on normal hands yields highest overall EV"
+  },
+  "pot_odds": {
+    "call_rule": "call when equity >= required equity based on pot odds",
+    "required_equity_formula": "call_amt / (pot + call_amt)",
+    "bluff_catch_frequency": "never call with marginal hands unless pot odds dictate",
+    "fold_to_aggression": "fold when equity < required equity, even if deceptive"
+  },
+  "short_stack": {
+    "threshold_bb": 20,
+    "shove_min_ehs": 0.62,
+    "note": "If stack < 20BB, shove with any EHS >= 0.62 (ICM push-fold)"
+  }
+}

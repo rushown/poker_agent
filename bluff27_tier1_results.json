@@ -1,0 +1,37 @@
+[
+  {
+    "agent_id": "F_code_design",
+    "response": "{\n  \"detection_function\": \"def _is_72_offsuit(hole_cards):\\n    if len(hole_cards) != 2:\\n        return False\\n    ranks = set(c[0].upper() for c in hole_cards if c)\\n    suits = [c[1].lower() for c in hole_cards if len(c) >= 2]\\n    return '7' in ranks and '2' in ranks and len(set(suits)) == 2\",\n  \"override_logic\": {\n    \"preflop_no_bet\": {\n      \"action\": \"raise\",\n      \"sizing\": \"3BB\",\n      \"reason\": \"72_bluff_open\"\n    },\n    \"preflop_facing_raise\": {\n      \"action\": \"raise_allin\",\n      \"condition\": \"call_amount < 0.30 * ctx.stack\",\n      \"fallback\": \"fold\",\n      \"reason\": \"72_bluff_re_raise\"\n    },\n    \"postflop_no_bet\": {\n      \"action\": \"raise_allin\",\n      \"reason\": \"72_bluff_push\"\n    },\n    \"postflop_facing_bet\": {\n      \"action\": \"fold\",\n      \"exception_call\": \"if made pair on board (defer to normal strategy)\",\n      \"exception_raise\": \"if bet < 0.20 * pot, push all-in as bluff-raise\",\n      \"reason\": \"72_bluff_fold_or_raise\"\n    },\n    \"made_pair_override\": {\n      \"action\": \"defer_to_normal_strategy\",\n      \"note\": \"if 7 or 2 on board and we have at least a pair, let adaptive strategy handle\"\n    }\n  },\n  \"ehs_threshold_for_made_hand\": 0.52,\n  \"integration_note\": \"Inject _is_72_offsuit check at top of each street handler before EHS-based logic. For postflop facing bet, first check if board pairs our card: if yes, exit override and let normal strategy run. Else apply bluff logic (fold generally, but if bet < 20% pot raise all-in as bluff).\"\n}",
+    "error": null
+  },
+  {
+    "agent_id": "G_normal_strat",
+    "response": "{\n  \"normal_hand_strategy\": {\n    \"core_principle\": \"Play optimal poker based on proven GTO exploits, adapted to exploit bot tendencies, while preserving chips for 7-2 opportunities but not overly conservative.\",\n    \"preflop\": {\n      \"open_ip\": 0.36,\n      \"open_oop\": 0.28,\n      \"raise_size\": 3.0,\n      \"call_3bet_range\": \"standard optimal, adjust for bot fold tendency\",\n      \"4bet_range\": \"value-heavy, polarized vs. bots\"\n    },\n    \"flop\": {\n      \"cbet_frequency\": 0.80,\n      \"cbet_size\": 0.67,\n      \"value_bet_threshold\": 0.49,\n      \"bluff_frequency\": 0.0,\n      \"check_fold_ratio\": \"when below value threshold\"\n    },\n    \"turn\": {\n      \"value_bet_threshold\": 0.55,\n      \"bluff_frequency\": 0.0,\n      \"bet_size\": 0.75,\n      \"continuation_frequency\": \"only with strong hands\"\n    },\n    \"river\": {\n      \"value_bet_threshold\": 0.60,\n      \"bluff_frequency\": 0.0,\n      \"bet_size\": 0.85,\n      \"fold_to_raise\": \"if equity below required pot odds\"\n    },\n    \"aggression\": {\n      \"all_in_threshold\": 0.82,\n      \"raise_for_value_only\": true,\n      \"re_raise_threshold\": 0.75,\n      \"aggression_factor\": 1.0\n    },\n    \"adjustments\": {\n      \"exploit_all_in_fold\": \"use all-in only when hand meets threshold (0.82) to exploit 95% fold rate\",\n      \"exploit_postflop_call\": \"value bet heavy, no bluffs because bots rarely fold\",\n      \"short_stack_adjustment\": \"when stack < 20BB, reduce all-in threshold to 0.62\"\n    },\n    \"pot_odds\": {\n      \"call_rule\": \"call when equity >= required equity based on pot odds\",\n      \"required_equity_formula\": \"call_amt / (pot + call_amt)\",\n      \"bluff_catch_frequency\": \"never call with marginal hands unless pot odds dictate\",\n      \"fold_to_aggression\": \"fold when equity < required equity, even if deceptive\"\n    }\n  },\n  \"tournament_specific_adjustments\": [\n    \"Keep all-in threshold at 0.82 for normal hands (proven optimal)\",\n    \"Keep value floor at 0.49 for postflop betting\",\n    \"Add short-stack shove: push all-in with EHS >= 0.62 when stack < 20BB\",\n    \"No other changes to baseline plutus_optimal_v7 strategy\",\n    \"Do not over-conserve chips for 7-2 opportunities \u2013 optimal play on normal hands yields highest overall EV\"\n  ],\n  \"short_stack_rules\": {\n    \"threshold_bb\": 20,\n    \"shove_ehs\": 0.62\n  }\n}",
+    "error": null
+  },
+  {
+    "agent_id": "D_tournament",
+    "response": "{\n  \"attempt_every_72\": true,\n  \"max_stack_risk_pct\": 100,\n  \"preferred_pot_size_before_allin_bb\": 5,\n  \"optimal_sequence\": [\"open_raise_3bb\", \"flop_shove_allin\"],\n  \"fold_to_opponent_allin\": true,\n  \"ev_per_bluff_attempt\": 0.0,\n  \"ev_per_100_hands\": 0.0,\n  \"tournament_recommendations\": [\n    \"Open raise 3BB every time you have 7-2; opponents fold preflop ~48% of the time, giving an immediate win chance.\",\n    \"If called preflop, shove all-in on the flop (pot >5BB) \u2014 exploit the 95% fold-to-all-in tendency.\",\n    \"Never call an opponent's all-in with 7-2; fold to preserve chips.\",\n    \"Accept the ~2.6% bust risk per attempt for a ~97.4% success rate; this maximizes the probability of winning the $2,500 prize given the rarity of 7-2.\"\n  ]\n}",
+    "error": null
+  },
+  {
+    "agent_id": "E_exploit",
+    "response": "",
+    "error": null
+  },
+  {
+    "agent_id": "B_preflop",
+    "response": "",
+    "error": null
+  },
+  {
+    "agent_id": "A_ev_math",
+    "response": "",
+    "error": null
+  },
+  {
+    "agent_id": "C_postflop",
+    "response": "",
+    "error": null
+  }
+]
